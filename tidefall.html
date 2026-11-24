@@ -52,6 +52,7 @@ const Input={keys:{},axes:{x:0,y:0},btn:{a:false,b:false,menu:false},press:{a:fa
       Audio.unlock();if((k==="enter"||k==="escape")&&!e.repeat)this.press.menu=true;});
     addEventListener("keyup",e=>{this.keys[e.key.toLowerCase()]=false;});
     this.mobile=("ontouchstart" in window)||(navigator.maxTouchPoints||0)>0||/Android|iPhone|iPad|iPod|Mobi/i.test(navigator.userAgent||"");
+    try{if(/[?&]touch/.test(window.location.search))this.mobile=true;}catch(e){}
     canvas.addEventListener("pointerdown",e=>{Audio.unlock();this.pDown(e);},{passive:false});
     canvas.addEventListener("pointermove",e=>{this.pMove(e);},{passive:false});
     addEventListener("pointerup",e=>this.pUp(e));
