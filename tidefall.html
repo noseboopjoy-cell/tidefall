@@ -45,7 +45,7 @@ requestAnimationFrame(frame);
 
 // input: keyboard, touch, gamepad
 const Input={keys:{},axes:{x:0,y:0},btn:{a:false,b:false,menu:false},press:{a:false,b:false,menu:false},
-  mobile:false,stick:null,pts:{},
+  mobile:false,stick:null,pts:{},tap:null,
   init(){
     addEventListener("keydown",e=>{const k=e.key.toLowerCase();this.keys[k]=true;
       if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k))e.preventDefault();
@@ -67,7 +67,7 @@ const Input={keys:{},axes:{x:0,y:0},btn:{a:false,b:false,menu:false},press:{a:fa
     return null;},
   pDown(e){e.preventDefault();const r=canvas.getBoundingClientRect();
     const x=(e.clientX-r.left)/r.width*VW,y=(e.clientY-r.top)/r.height*VH;
-    const z=this.zone(x,y);if(!z)return;this.pts[e.pointerId]=z;
+    const z=this.zone(x,y);if(!z){this.tap={x,y};return;}this.pts[e.pointerId]=z;
     if(z==="stick")this.stick={x,y};
     else if(z==="a")this.btn.a=true;else if(z==="b")this.btn.b=true;else if(z==="menu")this.btn.menu=true;},
   pMove(e){if(this.pts[e.pointerId]!=="stick")return;const r=canvas.getBoundingClientRect();
@@ -1288,8 +1288,19 @@ const UI={mode:null,sel:0,shop:null,shopTab:0,craftSel:0,invSel:0,pauseSel:0,tit
     const opts=["New game","Continue","Boss rush"];
     opts.forEach((t,i)=>{ctx.fillStyle=this.titleSel===i?"#f2c14e":"#cbb6e2";ctx.font="10px monospace";
       ctx.fillText((this.titleSel===i?"> ":"")+t,VW/2,140+i*16);});
-    ctx.fillStyle="#5a5a7a";ctx.font="7px monospace";
-    ctx.fillText("WASD/arrows move  A(Z) attack  B(X) potion/throw  Esc menu",VW/2,250);},
+    if(Input.mobile){ctx.font="9px monospace";ctx.textAlign="center";
+      ctx.strokeStyle="#fff";ctx.fillStyle="#fff";ctx.globalAlpha=.35;
+      const sx=Input.stick?Input.stick.x:34,sy=Input.stick?Input.stick.y:VH-36;
+      ctx.beginPath();ctx.arc(sx,sy,20,0,6.283);ctx.stroke();
+      if(Input.stick){ctx.beginPath();ctx.arc(sx+Input.axes.x*14,sy+Input.axes.y*14,8,0,6.283);ctx.fill();}
+      ctx.beginPath();ctx.arc(VW-32,VH-32,17,0,6.283);ctx.stroke();ctx.fillText("A",VW-32,VH-29);
+      ctx.beginPath();ctx.arc(VW-32,VH-88,14,0,6.283);ctx.stroke();ctx.fillText("B",VW-32,VH-85);
+      ctx.beginPath();ctx.arc(VW-14,14,9,0,6.283);ctx.stroke();ctx.fillText("=",VW-14,17);
+      ctx.globalAlpha=1;
+      ctx.fillStyle="#5a5a7a";ctx.font="7px monospace";
+      ctx.fillText("tap a menu item, or drag the stick and press A",VW/2,250);}
+    else{ctx.fillStyle="#5a5a7a";ctx.font="7px monospace";
+      ctx.fillText("WASD/arrows move  A(Z) attack  B(X) potion/throw  Esc menu",VW/2,250);}},
   renderEnding(key){const e=ENDINGS[key];
     ctx.fillStyle="#0b0817";ctx.fillRect(0,0,VW,VH);
     ctx.textAlign="center";ctx.fillStyle="#f2c14e";ctx.font="bold 13px monospace";
@@ -1332,6 +1343,10 @@ function TITLE_SCENE(){const s={update(dt){UI.titleSceneUpdate&&null;},render(){
     if(Input.axes.y<-.5&&!UI._t1){UI.titleSel=(UI.titleSel+2)%3;Audio.sfx("menu");UI._t1=1;}
     if(Input.axes.y>.5&&!UI._t2){UI.titleSel=(UI.titleSel+1)%3;Audio.sfx("menu");UI._t2=1;}
     if(!Input.axes.y){UI._t1=0;UI._t2=0;}
+    if(Input.tap){const t=Input.tap;Input.tap=null;
+      if(t.y>124&&t.y<180){const idx=Math.max(0,Math.min(2,Math.round((t.y-140)/16)));
+        if(idx!==UI.titleSel){UI.titleSel=idx;Audio.sfx("menu");return;}
+        b.a=true;}}
     if(b.a){Audio.sfx("confirm");
       if(UI.titleSel===0){Game.start(true);Scenes.switchTo(worldScene());}
       else if(UI.titleSel===1){
