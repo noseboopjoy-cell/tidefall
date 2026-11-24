@@ -1,0 +1,1379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Tidefall</title>
+<style>
+  html,body{margin:0;padding:0;background:#0b0817;height:100%;overflow:hidden;touch-action:none;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{image-rendering:pixelated;image-rendering:crisp-edges;display:block}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="480" height="270"></canvas></div>
+<script>
+
+// engine.js - canvas, loop, input, audio, save, scenes, fx
+"use strict";
+const VW=480, VH=270, TS=16;
+const canvas=document.getElementById("game"), ctx=canvas.getContext("2d");
+ctx.imageSmoothingEnabled=false;
+function fitCanvas(){
+  const w=innerWidth,h=innerHeight,s=Math.max(1,Math.min(w/VW,h/VH));
+  canvas.style.width=(VW*s)+"px";canvas.style.height=(VH*s)+"px";
+}
+addEventListener("resize",fitCanvas);fitCanvas();
+
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+let seed=1234;
+function rnd(){seed=(seed*1103515245+12345)&0x7fffffff;return seed/0x7fffffff;}
+const rint=n=>Math.floor(rnd()*n);
+const pick=a=>a[rint(a.length)];
+const dist=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+const aabb=(a,b)=>a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;
+
+// fixed timestep loop
+const STEP=1/60;let acc=0,last=performance.now();
+function frame(now){acc+=Math.min(.25,(now-last)/1000);last=now;
+  while(acc>=STEP){Scenes.update(STEP);acc-=STEP;}
+  ctx.setTransform(1,0,0,1,0,0);Scenes.render();requestAnimationFrame(frame);}
+requestAnimationFrame(frame);
+
+// input: keyboard, touch, gamepad
+const Input={keys:{},axes:{x:0,y:0},btn:{a:false,b:false,menu:false},press:{a:false,b:false,menu:false},
+  tOn:false,tx:0,ty:0,
+  init(){
+    addEventListener("keydown",e=>{const k=e.key.toLowerCase();this.keys[k]=true;
+      if(["arrowup","arrowdown","arrowleft","arrowright"," "].includes(k))e.preventDefault();
+      Audio.unlock();if((k==="enter"||k==="escape")&&!e.repeat)this.press.menu=true;});
+    addEventListener("keyup",e=>{this.keys[e.key.toLowerCase()]=false;});
+    canvas.addEventListener("pointerdown",e=>{Audio.unlock();this.tOn=true;this.tStart(e);},{passive:false});
+    canvas.addEventListener("pointermove",e=>{if(this.tOn)this.tStart(e);});
+    addEventListener("pointerup",()=>{this.tOn=false;this.axes={x:0,y:0};});
+    addEventListener("pointercancel",()=>{this.tOn=false;this.axes={x:0,y:0};});
+    addEventListener("blur",()=>{this.keys={};this.axes={x:0,y:0};});
+  },
+  tStart(e){
+    const r=canvas.getBoundingClientRect();
+    const x=(e.clientX-r.left)/r.width*VW,y=(e.clientY-r.top)/r.height*VH;
+    // buttons (right side): A lower, B upper
+    if(x>VW-58&&y>VH-58){this.btn.a=true;this.tB={x,y};return;}
+    if(x>VW-58&&y>VH-108&&y<=VH-58){this.btn.b=true;this.tB={x,y};return;}
+    if(this.menuBtn&&x>VW-30&&y<26){this.btn.menu=true;return;}
+    // joystick (left side)
+    const jx=34,jy=VH-36,dx=x-jx,dy=y-jy,d=Math.hypot(dx,dy);
+    if(x<VW*0.5){const m=Math.min(1,d/22);if(d>4){this.axes.x=dx/d*m;this.axes.y=dy/d*m;}else{this.axes.x=0;this.axes.y=0;}}
+    this.tB=null;
+  },
+  poll(){
+    if(!this.tOn){
+      let x=0,y=0;
+      if(this.keys["arrowleft"]||this.keys["a"])x--;if(this.keys["arrowright"]||this.keys["d"])x++;
+      if(this.keys["arrowup"]||this.keys["w"])y--;if(this.keys["arrowdown"]||this.keys["s"])y++;
+      const l=Math.hypot(x,y);if(l>1){x/=l;y/=l;}this.axes={x,y};
+    }
+    if(navigator.getGamepads){const gp=navigator.getGamepads()[0];
+      if(gp){const gx=gp.axes[0]||0,gy=gp.axes[1]||0;if(Math.hypot(gx,gy)>.25){this.axes={x:gx,y:gy};this.tOn=false;}
+        if(gp.buttons[0]&&gp.buttons[0].pressed)this.btn.a=true;
+        if(gp.buttons[1]&&gp.buttons[1].pressed)this.btn.b=true;
+        if(gp.buttons[9]&&gp.buttons[9].pressed)this.btn.menu=true;}}
+    if(this.keys["z"]||this.keys["j"])this.btn.a=true;
+    if(this.keys["x"]||this.keys["k"])this.btn.b=true;
+  },
+  consume(){const p={...this.press};for(const k in this.press)this.press[k]=false;
+    const b={a:this.btn.a,b:this.btn.b,menu:this.btn.menu};
+    this.btn.a=false;this.btn.b=false;this.btn.menu=false;
+    for(const k in b)if(b[k])p[k]=true;return p;}
+};
+Input.init();
+
+// audio: synth sfx + pattern sequencer
+const NOTE=m=>m>0?440*Math.pow(2,(m-69)/12):0;
+const Audio={ctx:null,master:null,mus:null,sfxG:null,unlocked:false,track:null,step:0,nextT:0,
+  unlock(){if(this.unlocked)return;const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;
+    this.ctx=new AC();this.master=this.ctx.createGain();this.master.gain.value=.6;this.master.connect(this.ctx.destination);
+    this.mus=this.ctx.createGain();this.mus.gain.value=.5;this.mus.connect(this.master);
+    this.sfxG=this.ctx.createGain();this.sfxG.gain.value=.7;this.sfxG.connect(this.master);
+    this.unlocked=true;},
+  tone(f,t,d,type,v,dest,slide){const o=this.ctx.createOscillator(),g=this.ctx.createGain();
+    o.type=type;o.frequency.setValueAtTime(f,t);if(slide)o.frequency.exponentialRampToValueAtTime(Math.max(20,f*slide),t+d);
+    g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.0008,t+d);
+    o.connect(g);g.connect(dest||this.sfxG);o.start(t);o.stop(t+d+.02);},
+  noise(t,d,v,dest){const n=this.ctx.createBufferSource(),b=this.ctx.createBuffer(1,2048,this.ctx.sampleRate),
+    dt=b.getChannelData(0);for(let i=0;i<2048;i++)dt[i]=Math.random()*2-1;n.buffer=b;
+    const f=this.ctx.createBiquadFilter();f.type="highpass";f.frequency.value=3000;
+    const g=this.ctx.createGain();g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.001,t+d);
+    n.connect(f);f.connect(g);g.connect(dest||this.sfxG);n.start(t);n.stop(t+d);},
+  sfx(n){if(!this.unlocked)return;const t=this.ctx.currentTime;
+    switch(n){
+      case "menu":this.tone(620,t,.05,"square",.1);break;
+      case "confirm":this.tone(660,t,.05,"square",.12);this.tone(990,t+.05,.08,"square",.12);break;
+      case "cancel":this.tone(300,t,.08,"square",.1);break;
+      case "hit":this.noise(t,.06,.2);this.tone(180,t,.06,"sawtooth",.15,null,.6);break;
+      case "crit":this.tone(880,t,.1,"square",.15,null,1.6);this.noise(t,.08,.25);break;
+      case "hurt":this.tone(140,t,.2,"sawtooth",.25,null,.7);break;
+      case "swing":this.noise(t,.05,.08);break;
+      case "potion":this.tone(500,t,.1,"triangle",.15,null,1.8);break;
+      case "brew":this.tone(330,t,.15,"triangle",.15,null,1.4);this.tone(495,t+.12,.15,"triangle",.12);break;
+      case "coin":this.tone(1050,t,.06,"square",.12);this.tone(1400,t+.06,.1,"square",.12);break;
+      case "level":this.tone(523,t,.1,"square",.15);this.tone(659,t+.1,.1,"square",.15);this.tone(784,t+.2,.2,"square",.15);break;
+      case "boss":this.tone(110,t,.4,"sawtooth",.3,null,.8);this.noise(t,.3,.2);break;
+      case "die":this.tone(220,t,.5,"sawtooth",.2,null,.3);break;
+      case "door":this.tone(440,t,.12,"triangle",.12);break;
+    }},
+  play(name){this.unlock();this.track=TRACKS[name]||null;this.step=0;this.nextT=this.ctx?this.ctx.currentTime+.05:0;},
+  stop(){this.track=null;},
+  tick(){if(!this.unlocked||!this.track)return;const tr=this.track,spb=15/tr.bpm;
+    while(this.nextT<this.ctx.currentTime+.15){
+      const s=this.step,t=this.nextT;
+      const L=tr.lead[s%tr.lead.length];if(L)this.tone(NOTE(L+tr.key),t,spb*tr.pw||spb*.85,tr.wave||"square",.09,this.mus);
+      const B=tr.bass[s%tr.bass.length];if(B)this.tone(NOTE(B+tr.key-12),t,spb*.9,"triangle",.14,this.mus);
+      if(tr.drum){if(s%4===0)this.noise(t,.09,.14,this.mus);if(s%4===2)this.noise(t,.05,.05,this.mus);}
+      this.step++;this.nextT+=spb;}}
+};
+// music tracks (midi note numbers, 0 = rest), key offset in semitones
+const TRACKS={
+  title:{bpm:100,key:0,drum:1,lead:[0,0,72,0,76,0,79,0,77,0,76,0,72,0,69,0,0,0,71,0,74,0,77,0,76,0,74,0,72,0,0,0],
+         bass:[48,0,0,0,43,0,0,0,45,0,0,0,41,0,0,0,48,0,0,0,43,0,0,0,45,0,0,0,47,0,0,0]},
+  village:{bpm:110,key:0,drum:0,lead:[76,0,79,0,84,0,79,0,81,0,79,0,76,0,72,0,74,0,76,0,79,0,76,0,74,0,72,0,69,0,0,0],
+         bass:[52,0,59,0,52,0,59,0,50,0,57,0,50,0,57,0,48,0,55,0,48,0,55,0,45,0,52,0,45,0,52,0]},
+  field:{bpm:120,key:0,drum:1,lead:[69,0,72,76,0,74,72,0,69,0,71,74,0,72,71,0,67,0,71,74,0,73,71,0,69,0,71,72,71,0,69,0],
+         bass:[45,45,0,45,52,0,45,0,41,41,0,41,48,0,41,0,43,43,0,43,50,0,43,0,45,45,0,45,40,0,40,0]},
+  swamp:{bpm:90,key:0,drum:0,wave:"sawtooth",lead:[0,68,0,66,0,63,0,0,0,66,0,64,0,61,0,0,0,63,0,61,0,58,0,0,0,61,0,0,0,0,0,0],
+         bass:[39,0,39,0,37,0,37,0,34,0,34,0,36,0,36,0,39,0,39,0,37,0,37,0,34,0,34,0,36,0,36,0]},
+  battle:{bpm:150,key:0,drum:1,lead:[76,79,83,0,76,79,83,0,77,80,84,0,77,80,84,0,74,78,81,0,74,78,81,0,76,79,83,0,84,0,83,0],
+         bass:[40,0,47,0,40,0,47,0,42,0,49,0,42,0,49,0,38,0,45,0,38,0,45,0,40,0,47,0,47,0,47,0]},
+  boss:{bpm:160,key:1,drum:1,wave:"sawtooth",lead:[68,68,0,68,71,0,68,66,68,68,0,75,0,74,0,0,70,70,0,70,73,0,70,68,70,70,0,77,0,76,0,0],
+         bass:[32,32,44,32,32,32,44,32,30,30,42,30,30,30,42,30,31,31,43,31,31,31,43,31,32,32,44,32,44,0,44,0]},
+  ending:{bpm:80,key:0,drum:0,lead:[72,0,74,0,76,0,79,0,0,0,76,0,74,0,72,0,71,0,72,0,74,0,76,0,0,0,0,0,0,0,0,0],
+         bass:[48,0,0,0,52,0,0,0,45,0,0,0,50,0,0,0,43,0,0,0,47,0,0,0,48,0,0,0,48,0,0,0]}
+};
+
+// persistence
+const Save={KEY:"tidefall_save_v1",
+  fresh(){return {v:1,level:1,xp:0,gold:30,chapter:1,map:"village",px:200,py:150,dir:"down",
+    hp:30,maxhp:30,weapon:"sword1",armor:null,cloak:null,ring:null,
+    inv:{potion_heal:2,potion_majheal:0,potion_vigour:0,potion_stone:0,potion_swift:0,potion_anti:0,potion_fire:0,potion_frost:0,potion_shock:0,potion_venom:0,potion_cleanse:0,potion_tide:0},
+    mats:{herb:2,salt:0,fang:0,bloom:0,crystal:0,pearl:0,ash:0},
+    recipes:["heal"],quests:{},flags:{},kills:0,playtime:0,bossRush:false,ngplus:0};},
+  data:null,
+  load(){if(!this.data)this.data=this.fresh();
+    try{const r=localStorage.getItem(this.KEY);if(r){const d=JSON.parse(r);if(d&&d.v===1)this.data=d;}}catch(e){}
+    return this.data;},
+  write(){if(!this.data)return;try{localStorage.setItem(this.KEY,JSON.stringify(this.data));}catch(e){}},
+  wipe(){try{localStorage.removeItem(this.KEY);}catch(e){}this.data=this.fresh();}
+};
+setInterval(()=>Save.write(),30000);
+
+// scenes
+const Scenes={stack:[],
+  push(s){this.stack.push(s);if(s.enter)s.enter();},
+  pop(){const s=this.stack.pop();if(s.exit)s.exit();},
+  switchTo(s){while(this.stack.length)this.pop();this.push(s);},
+  update(dt){Audio.tick();Input.poll();const t=this.stack[this.stack.length-1];if(t&&t.update)t.update(dt);},
+  render(){const t=this.stack[this.stack.length-1];if(t&&t.render)t.render();else{ctx.fillStyle="#0b0817";ctx.fillRect(0,0,VW,VH);}}};
+
+// fx: particles, floating text, shake, fade
+const FX={parts:[],texts:[],shake:0,fade:1,fadeDir:-1,fadeCb:null,
+  burst(x,y,color,n=8,spd=60){for(let i=0;i<n;i++){const a=Math.random()*6.283,s=spd*(.4+Math.random()*.8);
+    this.parts.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:.4+Math.random()*.4,color,r:1+Math.random()*2});}},
+  text(x,y,msg,color="#fff"){this.texts.push({x,y,msg,color,life:1});},
+  doShake(n){this.shake=Math.max(this.shake,n);},
+  fadeTo(cb){this.fadeDir=1;this.fadeCb=cb;},
+  update(dt){
+    for(let i=this.parts.length-1;i>=0;i--){const p=this.parts[i];p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=40*dt;p.life-=dt;if(p.life<=0)this.parts.splice(i,1);}
+    for(let i=this.texts.length-1;i>=0;i--){const t=this.texts[i];t.y-=18*dt;t.life-=dt*1.2;if(t.life<=0)this.texts.splice(i,1);}
+    if(this.shake>0)this.shake-=dt*30;
+    if(this.fadeDir>0){this.fade+=dt*3;if(this.fade>=1){this.fade=1;this.fadeDir=0;if(this.fadeCb){const cb=this.fadeCb;this.fadeCb=null;cb();}}}
+    else if(this.fadeDir<0){this.fade-=dt*3;if(this.fade<=0){this.fade=0;this.fadeDir=0;}}
+  },
+  render(){
+    for(const p of this.parts){ctx.globalAlpha=Math.max(0,p.life*2);ctx.fillStyle=p.color;ctx.fillRect(p.x|0,p.y|0,p.r,p.r);}
+    ctx.globalAlpha=1;ctx.textAlign="center";ctx.font="bold 8px monospace";
+    for(const t of this.texts){ctx.globalAlpha=Math.max(0,Math.min(1,t.life*2));ctx.fillStyle="#000";ctx.fillText(t.msg,t.x+1,t.y+1);ctx.fillStyle=t.color;ctx.fillText(t.msg,t.x,t.y);}
+    ctx.globalAlpha=1;
+    if(this.shake>0)ctx.translate(rint(5)-2,rint(5)-2);
+  },
+  renderFade(){if(this.fade>0){ctx.fillStyle="rgba(6,4,12,"+this.fade+")";ctx.fillRect(-8,-8,VW+16,VH+16);}}
+};
+
+// art.js - procedural 32-bit-style sprites, all drawn in code
+"use strict";
+function mk(w,h,fn){const c=document.createElement("canvas");c.width=w;c.height=h;const g=c.getContext("2d");g.imageSmoothingEnabled=false;fn(g);return c;}
+function P(g,x,y,w,h,c){g.fillStyle=c;g.fillRect(x,y,w,h);}
+function shade(c,f){const n=parseInt(c.slice(1),16);let r=(n>>16)&255,gg=(n>>8)&255,b=n&255;
+  r=clamp(r*f|0,0,255);gg=clamp(gg*f|0,0,255);b=clamp(b*f|0,0,255);
+  return "#"+((1<<24)+(r<<16)+(gg<<8)+b).toString(16).slice(1);}
+function heroBody(g,dir,fr,pal){
+  const bob=(fr===1||fr===3)?-1:0;
+  const legL=fr===1?-1:fr===3?1:0;
+  const W=16,H=18;
+  const cx=8;
+  // legs + boots
+  P(g,cx-3,14,2,4+legL,pal.pants);P(g,cx+1,14,2,4-legL,pal.pants);
+  P(g,cx-3,16+legL,3,2,pal.boot);P(g,cx+1,16-legL,3,2,pal.boot);
+  // coat body
+  P(g,cx-4,6+bob,8,9,pal.coat);
+  P(g,cx-4,12+bob,8,4,pal.coat2);
+  P(g,cx-4,6+bob,8,1,pal.trim);
+  // satchel strap
+  if(dir!=="up"){P(g,cx-4,7+bob,9,1,pal.strap);}
+  // satchel
+  P(g,cx+(dir==="side"?-5:3),10+bob,3,3,pal.strap);
+  // arms
+  P(g,cx-5,8+bob,1,4,pal.coat2);P(g,cx+4,8+bob,1,4,pal.coat2);
+  // head/hood
+  P(g,cx-3,1+bob,6,6,pal.hood);
+  P(g,cx-2,2+bob,4,4,dir==="up"?pal.hood:pal.skin);
+  if(dir==="down"){P(g,cx-2,3+bob,1,1,"#20181f");P(g,cx+1,3+bob,1,1,"#20181f");
+    P(g,cx-2,6+bob,4,1,pal.skin);}
+  if(dir==="side"){P(g,cx+1,3+bob,1,1,"#20181f");P(g,cx+1,6+bob,2,1,pal.skin);}
+  // hood rim + top
+  P(g,cx-3,1+bob,6,1,pal.trim);P(g,cx-3,0+bob,6,1,pal.hood);
+  // flask on belt
+  P(g,cx+(dir==="side"?2:-1),11+bob,2,3,pal.flask);
+  P(g,cx+(dir==="side"?2:-1),10+bob,2,1,pal.trim);
+}
+const HERO_PAL={coat:"#2a7f8f",coat2:"#20707f",trim:"#f2c14e",pants:"#31435e",boot:"#6e4a2f",
+  skin:"#e8b88a",hood:"#2a7f8f",strap:"#5c4127",flask:"#d97b4a"};
+function heroFrames(){
+  const out={};
+  for(const dir of["down","up","side"]){
+    out[dir]=[0,1,2,3].map(fr=>mk(16,18,g=>heroBody(g,dir,fr,HERO_PAL)));
+  }
+  out.attack=mk(16,18,g=>{heroBody(g,"side",0,HERO_PAL);});
+  return out;
+}
+// salamander companion
+function salFrames(){
+  return [0,1,2,3].map(fr=>mk(14,10,g=>{
+    const bob=fr%2?-1:0;const tail=fr%4<2?1:0;
+    P(g,3,2+bob,7,5,"#e07b2f");P(g,2,3+bob,2,3,"#e07b2f");
+    P(g,10,1+bob-tail,3,1,"#c9641f");P(g,11,2+bob,2,1,"#c9641f");
+    P(g,9,0+bob-tail,1,3,"#c9641f");
+    P(g,2,3+bob,1,1,"#20181f");P(g,4,3+bob,1,1,"#20181f");
+    P(g,3,5+bob,1,2,"#ff9a4d");P(g,6,6+bob,1,1,"#ff9a4d");
+    P(g,4,6+bob,4,1,"#ffb066");
+    P(g,5,3+bob,1,1,"#ffd166");
+  }));
+}
+// generic enemy drawing via key
+const ENEMY_ART={
+  wisp:(g,p)=>{ // jellyfish
+    P(g,4,2,8,5,p.a);P(g,5,1,6,1,p.b);P(g,5,7,6,1,p.b);
+    P(g,6,3,4,3,p.c);
+    for(let i=0;i<5;i++){P(g,4+i*2,8,1,3+((i+1)%2)*2,p.b);}
+    P(g,7,3,2,2,p.c);
+  },
+  slime:(g,p)=>{P(g,3,6,10,6,p.a);P(g,4,4,8,3,p.a);P(g,5,3,6,1,p.b);
+    P(g,5,6,2,2,"#1a1420");P(g,9,6,2,2,"#1a1420");P(g,7,9,3,1,"#1a1420");
+    P(g,4,5,3,1,p.c);},
+  crab:(g,p)=>{P(g,3,7,10,5,p.a);P(g,4,5,8,2,p.a);P(g,2,6,2,3,p.b);P(g,12,6,2,3,p.b);
+    P(g,2,4,2,2,p.b);P(g,12,4,2,2,p.b);
+    P(g,5,6,1,1,"#fff");P(g,10,6,1,1,"#fff");
+    P(g,4,12,1,2,p.b);P(g,7,12,1,2,p.b);P(g,11,12,1,2,p.b);},
+  bat:(g,p)=>{P(g,6,6,4,4,p.a);P(g,5,5,2,2,p.b);P(g,9,5,2,2,p.b);
+    P(g,1,4,4,3,p.b);P(g,11,4,4,3,p.b);P(g,3,3,2,1,p.b);P(g,11,3,2,1,p.b);
+    P(g,7,7,1,1,"#ffd166");P(g,8,7,1,1,"#ffd166");},
+  mushroom:(g,p)=>{P(g,2,3,12,4,p.a);P(g,3,2,10,1,p.b);P(g,4,7,8,2,p.a);
+    P(g,5,9,6,5,"#e8dcc8");P(g,5,10,1,1,"#1a1420");P(g,10,10,1,1,"#1a1420");
+    P(g,6,4,2,1,p.c);P(g,9,5,2,1,p.c);},
+  golem:(g,p)=>{P(g,3,4,10,9,p.a);P(g,4,2,8,2,p.b);
+    P(g,1,6,2,5,p.b);P(g,13,6,2,5,p.b);P(g,4,14,3,2,p.b);P(g,9,14,3,2,p.b);
+    P(g,5,6,2,2,p.c);P(g,9,6,2,2,p.c);P(g,6,10,4,1,p.b);},
+  wraith:(g,p)=>{P(g,5,2,6,6,p.a);P(g,6,1,4,1,p.b);
+    P(g,6,3,1,1,"#8ff0e8");P(g,9,3,1,1,"#8ff0e8");
+    P(g,4,8,8,5,p.b);P(g,3,11,3,3,p.b);P(g,10,11,3,3,p.b);},
+  knight:(g,p)=>{P(g,4,3,8,7,p.a);P(g,5,1,6,2,p.b);P(g,5,0,6,1,p.b);
+    P(g,6,5,1,1,"#ff5d5d");P(g,9,5,1,1,"#ff5d5d");
+    P(g,3,5,1,4,p.b);P(g,12,5,1,4,p.b);
+    P(g,5,10,2,6,p.p);P(g,9,10,2,6,p.p);
+    P(g,13,2,2,6,"#cfd6e6");},
+  lurker:(g,p)=>{P(g,2,7,9,4,p.a);P(g,11,4,4,6,p.a);
+    P(g,13,5,1,1,"#ffd166");P(g,0,8,2,2,p.b);P(g,12,9,3,2,p.b);
+    P(g,3,8,3,1,p.b);},
+  spore:(g,p)=>{P(g,5,5,6,6,p.a);P(g,6,4,4,1,p.b);
+    P(g,6,6,1,1,"#20181f");P(g,9,6,1,1,"#20181f");
+    P(g,4,10,2,3,p.c);P(g,10,10,2,3,p.c);
+    P(g,3,3,2,2,p.b);P(g,11,3,2,2,p.b);}
+};
+const ENEMY_PAL={
+  wisp:{a:"#8f6bb8",b:"#4a3d63",c:"#7df0dd"},
+  slime:{a:"#5cbf6a",b:"#8fe89a",c:"#a9f7b3"},
+  crab:{a:"#d96b43",b:"#a34a2c"},
+  bat:{a:"#6b5a8f",b:"#4a3d63"},
+  mushroom:{a:"#c05a78",b:"#e58aa3",c:"#f2d16b"},
+  golem:{a:"#8a8f9c",b:"#5f6572",c:"#7df0dd"},
+  wraith:{a:"#3d4a63",b:"#2a3245"},
+  knight:{a:"#9aa7c0",b:"#5f6a85",p:"#31435e"},
+  lurker:{a:"#4a9e8f",b:"#2f7a6e"},
+  spore:{a:"#b86bb8",b:"#8f4a9e",c:"#d9a3e0"}
+};
+function enemySprite(key){const p=ENEMY_PAL[key]||ENEMY_PAL.wisp;return mk(16,16,g=>ENEMY_ART[key](g,p));}
+// bosses: 48x48
+function bossArt(key){
+  const f={
+    fenmaw(g){ // giant bog frog
+      P(g,8,14,32,22,"#4a8f5a");P(g,10,10,28,10,"#5fae6e");
+      P(g,12,4,10,10,"#4a8f5a");P(g,26,4,10,10,"#4a8f5a");
+      P(g,15,7,4,4,"#f2d16b");P(g,14,6,6,2,"#2f5a38");
+      P(g,29,7,4,4,"#f2d16b");P(g,28,6,6,2,"#2f5a38");
+      P(g,14,24,20,6,"#2f5a38");P(g,16,25,16,4,"#1a2f22");
+      P(g,4,20,6,14,"#3a6f47");P(g,38,20,6,14,"#3a6f47");
+      P(g,12,30,8,4,"#2f5a38");P(g,28,30,8,4,"#2f5a38");},
+    bogmother(g){ // insect mother
+      P(g,10,8,28,26,"#8f5a9e");P(g,14,4,20,8,"#b88fc9");
+      P(g,16,6,4,3,"#ff5d5d");P(g,28,6,4,3,"#ff5d5d");
+      for(let i=0;i<5;i++){P(g,6,10+i*5,4,2,"#6e3d7a");P(g,38,10+i*5,4,2,"#6e3d7a");}
+      P(g,18,26,12,4,"#2a1a30");
+      for(let i=0;i<4;i++){P(g,12+i*7,34,3,8,"#6e3d7a");}},
+    stormgolem(g){P(g,12,6,24,28,"#7a8090");P(g,14,2,20,6,"#5a6070");
+      P(g,17,10,5,5,"#7df0dd");P(g,26,10,5,5,"#7df0dd");
+      P(g,6,12,6,16,"#5a6070");P(g,36,12,6,16,"#5a6070");
+      P(g,14,26,20,3,"#4a5060");
+      P(g,16,34,6,8,"#4a5060");P(g,26,34,6,8,"#4a5060");
+      P(g,10,0,8,3,"#7df0dd");P(g,30,0,8,3,"#7df0dd");},
+    skywarden(g){P(g,18,4,14,16,"#c9d4e8");P(g,20,2,10,4,"#8f9ec0");
+      P(g,21,8,4,2,"#2a7f8f");P(g,25,8,4,2,"#2a7f8f");
+      P(g,14,18,22,14,"#8f9ec0");P(g,2,14,12,6,"#e8eefc");P(g,36,14,12,6,"#e8eefc");
+      P(g,20,32,3,10,"#5f6a85");P(g,27,32,3,10,"#5f6a85");
+      P(g,16,20,4,8,"#f2c14e");},
+    leviathan(g){ // sea serpent from approved art
+      P(g,6,6,10,30,"#a35a3a");P(g,8,2,10,10,"#b86b45");
+      P(g,10,4,2,2,"#ff3b3b");P(g,14,4,2,2,"#ff3b3b");
+      P(g,9,9,8,4,"#6e2030");
+      for(let i=0;i<6;i++){P(g,4,10+i*4,4,3,"#b88fd9");P(g,16,10+i*4,3,3,"#b88fd9");}
+      P(g,18,26,24,10,"#a35a3a");P(g,20,28,20,6,"#8f4a2f");
+      P(g,26,22,14,6,"#b86b45");P(g,22,36,18,6,"#8f4a2f");
+      P(g,2,40,44,6,"#57c9d9");},
+    avatar(g){P(g,14,6,20,24,"#5ad9c9");P(g,16,2,16,6,"#a8f0e0");
+      P(g,18,10,4,4,"#0b0817");P(g,26,10,4,4,"#0b0817");
+      P(g,10,12,4,14,"#3fb8a8");P(g,34,12,4,14,"#3fb8a8");
+      P(g,18,32,12,10,"#2a8f85");
+      P(g,12,44,8,3,"#57c9d9");P(g,28,44,8,3,"#57c9d9");}
+  };
+  const cols={fenmaw:"#4a8f5a",bogmother:"#8f5a9e",stormgolem:"#7a8090",skywarden:"#8f9ec0",leviathan:"#a35a3a",avatar:"#5ad9c9"};
+  return mk(48,48,g=>{f[key](g);if(!key)P(g,0,0,1,1,cols[key]||"#fff");});
+}
+// tiles
+const TILES={};
+function buildTiles(){
+  const T=(k,fn)=>TILES[k]=mk(16,16,fn);
+  const noise=(g,base,spots,ncol)=>{P(g,0,0,16,16,base);for(let i=0;i<spots;i++)P(g,rint(15),rint(15),1,1,ncol);};
+  T("grass",g=>{noise(g,"#4f9e4f",14,"#5fae5f");P(g,3,4,2,1,"#6fbe6f");P(g,10,9,2,1,"#6fbe6f");});
+  T("grass2",g=>{noise(g,"#4f9e4f",14,"#5fae5f");P(g,4,3,1,2,"#f2d16b");P(g,11,10,1,2,"#e58aa3");});
+  T("path",g=>{noise(g,"#b09468",10,"#a3855c");});
+  T("water",g=>{noise(g,"#3f6fb8",6,"#5585c8");P(g,2,4,5,1,"#6b9ad8");P(g,9,11,5,1,"#6b9ad8");});
+  T("poison",g=>{noise(g,"#6e4a9e",6,"#8f5ab8");P(g,2,4,5,1,"#a87fc9");P(g,9,11,4,1,"#a87fc9");});
+  T("tree",g=>{P(g,7,11,2,5,"#6e4a2f");P(g,2,2,12,10,"#2f7a3f");P(g,3,1,10,2,"#3f8f4f");P(g,4,3,3,2,"#5fae6e");P(g,9,6,3,2,"#5fae6e");});
+  T("rock",g=>{P(g,2,6,12,9,"#7a8090");P(g,3,4,10,3,"#8f95a3");P(g,4,5,4,2,"#a3aab8");});
+  T("wall",g=>{P(g,0,0,16,16,"#6b7285");P(g,0,0,16,2,"#7d8496");P(g,0,5,16,1,"#5a6070");P(g,0,11,16,1,"#5a6070");P(g,5,2,1,3,"#5a6070");P(g,11,6,1,5,"#5a6070");P(g,3,12,1,4,"#5a6070");});
+  T("floor",g=>{noise(g,"#4a4560",8,"#555070");P(g,0,0,16,1,"#3d3852");P(g,0,8,16,1,"#3d3852");});
+  T("bridge",g=>{P(g,0,0,16,16,"#8a6b45");P(g,0,2,16,2,"#7a5c3a");P(g,0,8,16,2,"#7a5c3a");P(g,0,14,16,1,"#6a4f30");});
+  T("cliff",g=>{P(g,0,0,16,10,"#6b7285");P(g,0,10,16,6,"#4a4560");P(g,2,10,3,4,"#5a5570");});
+  T("cloud",g=>{noise(g,"#d8dcf0",0,"#fff");P(g,3,3,10,10,"#e8ecfc");P(g,1,5,14,8,"#e8ecfc");});
+  T("ash",g=>{noise(g,"#3d3852",12,"#4a4560");P(g,5,3,3,1,"#8f4a2f");});
+  T("lava",g=>{noise(g,"#c05a2f",6,"#e58a3f");P(g,2,6,6,2,"#ff9a4d");P(g,10,10,5,1,"#ff9a4d");});
+  T("sand",g=>{noise(g,"#d9c48f",10,"#c9b47f");});
+  // objects
+  T("herb",g=>{P(g,7,8,2,6,"#2f7a3f");P(g,3,4,4,3,"#6fd97f");P(g,9,3,4,3,"#6fd97f");P(g,5,6,3,2,"#8fe89a");P(g,9,6,3,2,"#8fe89a");});
+  T("chest",g=>{P(g,2,6,12,8,"#8a6b45");P(g,2,4,12,3,"#a3855c");P(g,7,8,2,3,"#f2c14e");P(g,2,7,12,1,"#5c4127");});
+  T("chestOpen",g=>{P(g,2,7,12,7,"#6a5236");P(g,7,9,2,2,"#5c4127");P(g,3,3,10,3,"#5c4127");});
+  T("sign",g=>{P(g,7,9,2,5,"#6e4a2f");P(g,3,3,10,6,"#a3855c");P(g,4,5,8,1,"#5c4127");P(g,4,7,6,1,"#5c4127");});
+  T("bench",g=>{P(g,2,4,12,10,"#5c4127");P(g,3,5,4,3,"#c9a03f");P(g,9,5,4,3,"#c9a03f");P(g,4,9,3,3,"#8f6bb8");P(g,10,10,2,2,"#5cbf6a");});
+  T("shopstall",g=>{P(g,2,2,12,3,"#c05a78");P(g,2,5,12,9,"#8a6b45");P(g,4,7,8,4,"#5c4127");P(g,5,8,2,2,"#f2c14e");P(g,9,8,2,2,"#7df0dd");});
+  T("door",g=>{P(g,3,2,10,14,"#6e4a2f");P(g,4,3,8,12,"#8a6b45");P(g,10,8,2,2,"#f2c14e");});
+  T("gate",g=>{P(g,2,0,12,16,"#5a6070");P(g,4,2,8,12,"#0b0817");P(g,4,2,8,2,"#3d3852");});
+  T("shrine",g=>{P(g,4,2,8,12,"#8f95a3");P(g,5,3,6,4,"#7df0dd");P(g,2,14,12,2,"#5a6070");});
+  T("crystal",g=>{P(g,6,2,4,10,"#7df0dd");P(g,7,1,2,2,"#a8f0e0");P(g,4,12,8,2,"#4ab8a8");});
+  T("vine",g=>{P(g,4,0,2,16,"#2f7a3f");P(g,8,0,2,13,"#3f8f4f");P(g,12,0,2,9,"#2f7a3f");P(g,5,5,2,2,"#8fe89a");});
+  T("bones",g=>{P(g,3,10,10,2,"#e8dcc8");P(g,5,6,2,4,"#e8dcc8");P(g,9,6,2,4,"#e8dcc8");P(g,6,4,4,2,"#e8dcc8");});
+  T("torch",g=>{P(g,7,6,2,9,"#6e4a2f");P(g,6,2,4,4,"#ff9a4d");P(g,7,1,2,2,"#ffd166");});
+}
+// item icons 8x8
+function potionIcon(color){return mk(8,8,g=>{P(g,3,0,2,1,"#cfd6e6");P(g,2,1,4,1,"#cfd6e6");P(g,1,2,6,5,"#aeb8d0");
+  P(g,2,3,4,3,color);P(g,2,3,4,1,shade(color,1.3));});}
+const MAT_ICONS={};
+function buildMatIcons(){
+  MAT_ICONS.herb=mk(8,8,g=>{P(g,5,1,2,2,"#6fd97f");P(g,3,3,3,2,"#6fd97f");P(g,5,5,1,3,"#2f7a3f");});
+  MAT_ICONS.salt=mk(8,8,g=>{P(g,2,3,4,4,"#e8ecfc");P(g,3,2,2,2,"#fff");});
+  MAT_ICONS.fang=mk(8,8,g=>{P(g,3,1,2,2,"#e8dcc8");P(g,3,3,1,2,"#e8dcc8");P(g,4,3,1,3,"#c9bfa8");P(g,4,6,1,1,"#c9bfa8");});
+  MAT_ICONS.bloom=mk(8,8,g=>{P(g,3,2,2,2,"#e58aa3");P(g,5,4,2,2,"#e58aa3");P(g,2,4,2,2,"#e58aa3");P(g,4,4,1,1,"#f2d16b");});
+  MAT_ICONS.crystal=mk(8,8,g=>{P(g,3,1,2,5,"#7df0dd");P(g,4,0,1,2,"#a8f0e0");P(g,2,6,4,1,"#4ab8a8");});
+  MAT_ICONS.pearl=mk(8,8,g=>{P(g,2,2,4,4,"#e8ecfc");P(g,3,3,1,1,"#fff");});
+  MAT_ICONS.ash=mk(8,8,g=>{P(g,2,3,4,3,"#8f8f9c");P(g,3,2,2,1,"#a3aab8");});
+}
+function buildArt(){hero=heroFrames();sal=salFrames();buildTiles();buildMatIcons();
+  for(const k in ENEMY_ART)ENEMY_SPRITES[k]=enemySprite(k);
+  BOSS_KEYS.forEach(k=>{BOSS_SPRITES[k]=bossArt(k);});}
+let hero=null,sal=null;
+const ENEMY_SPRITES={},BOSS_SPRITES={};
+const BOSS_KEYS=["fenmaw","bogmother","stormgolem","skywarden","leviathan","avatar"];
+const POT_COLORS={potion_heal:"#e84a5a",potion_majheal:"#ff2e5a",potion_vigour:"#ff9a4d",potion_stone:"#9aa7c0",
+  potion_swift:"#7df0dd",potion_anti:"#8fe89a",potion_fire:"#ff5d2f",potion_frost:"#8fc9ff",potion_shock:"#f2d16b",
+  potion_venom:"#9e4ab8",potion_cleanse:"#e8ecfc",potion_tide:"#57c9d9"};
+
+// data.js - items, weapons, enemies, bosses, npcs, quests, chapters
+"use strict";
+const WEAPONS={
+ sword1:{name:"Rustblade",type:"melee",dmg:5,cd:.4,range:14,cost:0},
+ sword2:{name:"Tidewater Edge",type:"melee",dmg:9,cd:.36,range:15,cost:180},
+ sword3:{name:"Abyssal Cleaver",type:"melee",dmg:14,cd:.42,range:17,cost:520},
+ spear1:{name:"Reed Spear",type:"thrust",dmg:6,cd:.45,range:22,cost:60},
+ spear2:{name:"Coral Lance",type:"thrust",dmg:10,cd:.42,range:24,cost:240},
+ spear3:{name:"Stormpike",type:"thrust",dmg:15,cd:.45,range:26,cost:600},
+ wand1:{name:"Twig Wand",type:"ranged",dmg:4,cd:.5,range:70,cost:80},
+ wand2:{name:"Moonwhisper",type:"ranged",dmg:8,cd:.45,range:80,cost:280},
+ wand3:{name:"Starfall Wand",type:"ranged",dmg:12,cd:.4,range:90,cost:640},
+ bomb1:{name:"Sputterbomb",type:"bomb",dmg:7,cd:.9,range:60,cost:90},
+ bomb2:{name:"Deepcharge",type:"bomb",dmg:12,cd:.85,range:70,cost:320},
+ bomb3:{name:"Tidebreaker",type:"bomb",dmg:18,cd:.9,range:80,cost:720}};
+const WEAPON_LINES=[["sword1","sword2","sword3"],["spear1","spear2","spear3"],["wand1","wand2","wand3"],["bomb1","bomb2","bomb3"]];
+const POTIONS={
+ potion_heal:{name:"Healing Draught",desc:"Restores 15 health.",use:"heal15",cost:18,recipe:{herb:2,salt:1}},
+ potion_majheal:{name:"Deep Healing",desc:"Restores 40 health.",use:"heal40",cost:45,recipe:{herb:3,crystal:1}},
+ potion_vigour:{name:"Vigour Tonic",desc:"+50% attack for 20s.",use:"buff_atk",cost:30,recipe:{herb:2,fang:1}},
+ potion_stone:{name:"Stoneskin Brew",desc:"Halve damage for 20s.",use:"buff_def",cost:30,recipe:{salt:2,crystal:1}},
+ potion_swift:{name:"Swiftfoot Elixir",desc:"+40% speed for 15s.",use:"buff_spd",cost:25,recipe:{herb:1,salt:1,bloom:1}},
+ potion_anti:{name:"Antivenom",desc:"Cures poison, immunity 20s.",use:"anti",cost:22,recipe:{bloom:2,pearl:1}},
+ potion_fire:{name:"Fire Flask",desc:"Thrown: burns a small area.",use:"throw_fire",cost:26,recipe:{ash:2,herb:1}},
+ potion_frost:{name:"Frost Flask",desc:"Thrown: slows enemies.",use:"throw_frost",cost:26,recipe:{crystal:1,salt:1}},
+ potion_shock:{name:"Shock Flask",desc:"Thrown: lightning arcs.",use:"throw_shock",cost:34,recipe:{crystal:2,pearl:1}},
+ potion_venom:{name:"Venom Cloud",desc:"Thrown: poisons enemies.",use:"throw_venom",cost:30,recipe:{bloom:2,ash:1}},
+ potion_cleanse:{name:"Cleansing Draught",desc:"Purifies a corrupted shrine.",use:"cleanse",cost:0,recipe:{herb:3,bloom:2,pearl:1}},
+ potion_tide:{name:"Essence of Tide",desc:"The final choice, in a bottle.",use:"tide",cost:0,recipe:{crystal:3,pearl:2,ash:2}}};
+const MAT_NAMES={herb:"Seagrass Herb",salt:"Brine Salt",fang:"Wisp Fang",bloom:"Gloom Bloom",crystal:"Storm Crystal",pearl:"Deep Pearl",ash:"Cinder Ash"};
+const ARMORS=[
+ {id:"armor1",name:"Padded Vest",def:2,cost:70},
+ {id:"armor2",name:"Reef Plate",def:4,cost:220,rarity:"rare"},
+ {id:"armor3",name:"Tideborn Aegis",def:7,cost:0,rarity:"epic"}];
+const CLOAKS=[
+ {id:"cloak1",name:"Traveller's Cloak",spd:12,cost:50},
+ {id:"cloak2",name:"Windweave Cloak",spd:22,cost:200,rarity:"rare"},
+ {id:"cloak3",name:"Leviathanweave",spd:26,def:3,cost:0,rarity:"epic"}];
+const RINGS=[
+ {id:"ring1",name:"Copper Ring",atk:1,cost:60},
+ {id:"ring2",name:"Brine Pearl Ring",hp:12,cost:180,rarity:"rare"},
+ {id:"ring3",name:"Storm Loop",atk:3,crit:.15,cost:0,rarity:"epic"}];
+const RARITY_COL={rare:"#7df0dd",epic:"#c9a03f",common:"#cbb6e2"};
+// enemies: key -> {hp,dmg,spd,xp,ai,tint(map variant),drops}
+const ENEMIES={
+ wisp:{hp:12,dmg:4,spd:26,xp:6,ai:"drift",drop:["fang",.4]},
+ slime:{hp:16,dmg:5,spd:20,xp:7,ai:"chase",drop:["herb",.3]},
+ crab:{hp:26,dmg:6,spd:14,xp:10,ai:"chase",drop:["salt",.4]},
+ bat:{hp:10,dmg:4,spd:44,xp:8,ai:"swoop",drop:["fang",.3]},
+ mushroom:{hp:20,dmg:5,spd:0,xp:9,ai:"turret",drop:["bloom",.45]},
+ golem:{hp:44,dmg:9,spd:12,xp:16,ai:"chase",drop:["crystal",.4]},
+ wraith:{hp:22,dmg:7,spd:34,xp:14,ai:"phase",drop:["ash",.4]},
+ knight:{hp:34,dmg:8,spd:24,xp:15,ai:"charge",drop:["pearl",.25]},
+ lurker:{hp:30,dmg:8,spd:38,xp:14,ai:"lunge",drop:["pearl",.3]},
+ spore:{hp:8,dmg:10,spd:16,xp:8,ai:"bomber",drop:["bloom",.4]}};
+const MAP_ENEMIES={meadow:["wisp","slime","crab"],swamp:["bat","mushroom","spore","slime"],
+ mountain:["golem","bat","crab"],ruins:["wraith","knight","bat"],abyss:["wisp","wraith","lurker","spore","golem"]};
+// palette variants per map for flavor: tint key
+const MAP_TINT={meadow:null,swamp:{slime:"spore"},mountain:null,ruins:null,abyss:null};
+const BOSSES=[
+ {id:"fenmaw",name:"Fenmaw",map:"meadow",hp:90,dmg:8,xp:60,ch:1,reward:{gold:120,armor:"armor1"},pat:["hop","spit"]},
+ {id:"bogmother",name:"The Bog Mother",map:"swamp",hp:150,dmg:10,xp:90,ch:2,reward:{gold:180,ring:"ring1"},pat:["spawn","spores","charge"]},
+ {id:"stormgolem",name:"Storm Golem",map:"mountain",hp:220,dmg:13,xp:130,ch:3,reward:{gold:240,cloak:"cloak1"},pat:["slam","shockwave","bolt"]},
+ {id:"skywarden",name:"Sky Warden",map:"ruins",hp:280,dmg:15,xp:180,ch:4,reward:{gold:320,weapon:"spear2"},pat:["dive","gale","summon"]},
+ {id:"leviathan",name:"Leviathan",map:"abyss",hp:380,dmg:18,xp:260,ch:5,reward:{gold:450,cloak:"cloak3"},pat:["coil","spit","tidewave","charge"]},
+ {id:"avatar",name:"Tidefall Avatar",map:"abyss",hp:480,dmg:20,xp:400,ch:6,reward:{gold:600,ring:"ring3"},pat:["spiral","spit","wave","charge","spawn"]}];
+// npcs: id,name,x,y(map obj),lines,role
+const NPCS=[
+ {id:"maren",name:"Elder Maren",role:"story",lines:["The sea was clean once, before the Tidefall.","Each boss you fell weakens the poison. The shrines remember.","When the Avatar rises, the sea will ask something of you. Choose with both eyes open."]},
+ {id:"bram",name:"Bram the Smith",role:"shop",lines:["Steel keeps better than hope. Mostly.","I can outfit you. Coin up front."]},
+ {id:"ivy",name:"Ivy the Herbalist",role:"shop2",lines:["Fresh seagrass, still humming with tide.","Bring me coin or bring me patience."]},
+ {id:"salt",name:"Old Salt",role:"quest",quest:"q_wisps",lines:["Wisps chewed my nets to lace again.","Cull five of them in the meadow and I'll owe you one."]},
+ {id:"mira",name:"Mira the Baker",role:"quest",quest:"q_book",lines:["I left my grandmother's recipe book by the swamp pools.","Soggy pages or not, I want it back."]},
+ {id:"pip",name:"Pip",role:"quest",quest:"q_boat",lines:["A wave took my toy boat! The big wave!","It floats somewhere in the swamp, I know it."]},
+ {id:"finn",name:"Finn the Dockhand",role:"quest",quest:"q_pearls",lines:["Storm cracked the cliffs open. Pearls everywhere up there.","Three pearls and I'll part with grandad's old plate."]},
+ {id:"tola",name:"Archivist Tola",role:"quest",quest:"q_shrines",lines:["Three corrupted shrines: meadow, swamp, mountain.","Pour a Cleansing Draught on each and history will thank you."]},
+ {id:"nori",name:"Nori",role:"flavor",lines:["I saw a jellyfish the size of a HOUSE.","It had a light inside like a lamp. Mum says don't go near the water."]},
+ {id:"pop",name:"Pop",role:"flavor",lines:["Salamanders taste like chicken, probably.","Don't tell yours I said that."]},
+ {id:"gate",name:"Gatekeeper",role:"gate",lines:["The wilds beyond are ranked by danger, east to west.","Fell each island's master and I'll open the next path."]}];
+const QUESTS={
+ q_wisps:{title:"Cull the Wisps",giver:"salt",need:{kill:"wisp",n:5},reward:{gold:80,ring:"ring1"},txt:"Slay 5 brine wisps for Old Salt."},
+ q_book:{title:"Mira's Recipe Book",giver:"mira",need:{item:"chest_book",n:1},reward:{gold:60,potion_majheal:2},txt:"Recover the recipe book from the swamp chest."},
+ q_boat:{title:"Pip's Toy Boat",giver:"pip",need:{item:"chest_boat",n:1},reward:{gold:40,cloak:"cloak1"},txt:"Find Pip's toy boat in the swamp."},
+ q_pearls:{title:"Pearls for Finn",giver:"finn",need:{mat:"pearl",n:3},reward:{armor:"armor2"},txt:"Bring Finn 3 deep pearls from the mountain."},
+ q_shrines:{title:"The Three Shrines",giver:"tola",need:{shrines:3},reward:{gold:150,weapon:"spear3"},txt:"Cleanse 3 corrupted shrines with Cleansing Draught."}};
+const CHAPTERS=[
+ {ch:1,title:"Chapter 1 - The Meadow Shore",sub:"Something stirs beyond the village.",track:"field"},
+ {ch:2,title:"Chapter 2 - The Gloomswamp",sub:"The blooms watch you pass.",track:"swamp"},
+ {ch:3,title:"Chapter 3 - The Howling Mount",sub:"Storm and stone walk together.",track:"field"},
+ {ch:4,title:"Chapter 4 - The Sky Ruins",sub:"Old wardens still keep their watch.",track:"swamp"},
+ {ch:5,title:"Chapter 5 - The Abyss",sub:"Down where the poison pools deepest.",track:"battle"},
+ {ch:6,title:"Finale - The Tidefall Avatar",sub:"The sea has a face now.",track:"boss"}];
+const ENDINGS={
+ healed:{title:"Ending - The Sea Remembers",lines:["You poured the Essence into the heart of the poison.","The violet drained to green, island by island.","With every shrine cleansed and every debt paid,","the Tidefall truly ended. The isles drift home.","TIDEFALL - ending 1 of 3"]},
+ contained:{title:"Ending - The Chain and the Flask",lines:["You bound the Avatar's essence into the copper flask.","The sea quiets, but the poison sleeps, not dies.","Your salamander hums against the glass.","Some storms are only borrowed.","TIDEFALL - ending 2 of 3"]},
+ lost:{title:"Ending - The Violet Tide",lines:["The Avatar dissolved into the sea, unbound.","The poison rose past the cliffs, past the roofs,","and the isles went quiet one by one.","The salamander kept the lamp lit a long while.","TIDEFALL - ending 3 of 3"]}};
+
+// world.js - maps built from ops, objects, camera, collision
+"use strict";
+const SOLID=new Set(["T","r","W","C","L","c","v","w","P"]);
+const CH2TILE={G:"grass",f:"grass2",p:"path",w:"water",P:"poison",T:"tree",r:"rock",W:"wall",
+  F:"floor",b:"bridge",C:"cliff",L:"lava",a:"ash",s:"sand",c:"crystal",v:"vine",o:"bones"};
+const MW=44,MH=26;
+const MAPS={
+ village:{base:"G",border:"w",track:"village",rects:[
+   {t:"p",x:20,y:10,w:4,h:6},{t:"p",x:8,y:13,w:28,h:2}],
+  sprinkle:[["T",26],["f",14]],objects:[
+   {o:"house",x:6,y:6,solid:1},{o:"house",x:16,y:5,solid:1},{o:"house",x:28,y:6,solid:1},
+   {o:"house",x:10,y:17,solid:1},{o:"house",x:26,y:17,solid:1},
+   {o:"shopstall",x:23,y:12,solid:0,shop:"bram"},
+   {o:"bench",x:18,y:14,solid:1},
+   {o:"shrine",x:34,y:11,solid:1,save:1},
+   {o:"door",x:41,y:13,w:1,h:4,to:"meadow",tx:2,ty:14,label:"Meadow Shore"}],
+  npcs:["maren","bram","ivy","salt","mira","pip","finn","tola","nori","pop","gate"]},
+ meadow:{base:"G",border:"w",track:"field",rects:[
+   {t:"p",x:0,y:12,w:8,h:3},{t:"f",x:10,y:6,w:8,h:4},{t:"f",x:26,y:16,w:8,h:5}],
+  sprinkle:[["T",30],["r",10]],objects:[
+   {o:"door",x:0,y:12,w:1,h:3,to:"village",tx:40,ty:14,label:"Emberdrift Village"},
+   {o:"door",x:21,y:24,w:3,h:1,to:"swamp",tx:20,ty:2,label:"Gloomswamp"},
+   {o:"door",x:42,y:6,w:1,h:3,to:"mountain",tx:2,ty:12,label:"Howling Mount"},
+   {o:"herbNode",x:12,y:8},{o:"herbNode",x:30,y:18},{o:"herbNode",x:24,y:7},
+   {o:"chest",x:36,y:4,loot:"chest1"},
+   {o:"shrine",x:8,y:5,corrupt:1},
+   {o:"boss",x:34,y:13,r:6,boss:"fenmaw",label:"Fenmaw"}],
+  spawns:[{x:10,y:4,w:24,h:16,types:["wisp","slime"],n:5}]},
+ swamp:{base:"G",border:"T",track:"swamp",rects:[
+   {t:"P",x:6,y:6,w:14,h:6},{t:"P",x:24,y:12,w:12,h:8},{t:"b",x:12,y:9,w:4,h:1},
+   {t:"f",x:4,y:18,w:8,h:4}],
+  sprinkle:[["T",40],["v",8]],objects:[
+   {o:"door",x:20,y:0,w:3,h:1,to:"meadow",tx:22,ty:23,label:"Meadow Shore"},
+   {o:"door",x:42,y:12,w:1,h:3,to:"mountain",tx:2,ty:14,label:"Howling Mount"},
+   {o:"herbNode",x:8,y:20},{o:"herbNode",x:30,y:20},{o:"herbNode",x:16,y:4},
+   {o:"chest",x:30,y:6,loot:"chest_book"},{o:"chest",x:6,y:3,loot:"chest_boat"},
+   {o:"shrine",x:36,y:18,corrupt:1},
+   {o:"boss",x:28,y:4,r:6,boss:"bogmother",label:"The Bog Mother"}],
+  spawns:[{x:4,y:3,w:32,h:18,types:["bat","mushroom","spore"],n:6}]},
+ mountain:{base:"r",border:"C",track:"field",rects:[
+   {t:"p",x:4,y:12,w:30,h:2},{t:"a",x:30,y:4,w:8,h:6},{t:"L",x:34,y:16,w:6,h:5}],
+  sprinkle:[["r",26],["c",5]],objects:[
+   {o:"door",x:0,y:12,w:1,h:3,to:"swamp",tx:40,ty:13,label:"Gloomswamp"},
+   {o:"door",x:20,y:0,w:3,h:1,to:"ruins",tx:20,ty:23,label:"Sky Ruins"},
+   {o:"herbNode",x:10,y:8},{o:"herbNode",x:24,y:18},
+   {o:"chest",x:36,y:2,loot:"chest2"},
+   {o:"shrine",x:14,y:18,corrupt:1},
+   {o:"boss",x:34,y:7,r:6,boss:"stormgolem",label:"Storm Golem"}],
+  spawns:[{x:6,y:4,w:26,h:16,types:["golem","bat","crab"],n:6}]},
+ ruins:{base:"F",border:"C",track:"swamp",rects:[
+   {t:"W",x:8,y:6,w:6,h:1},{t:"W",x:8,y:6,h:6,w:1},{t:"W",x:24,y:12,w:8,h:1},
+   {t:"W",x:32,y:6,h:8,w:1},{t:"o",x:14,y:14},{t:"o",x:28,y:8},{t:"o",x:20,y:4}],
+  sprinkle:[["v",10],["o",4]],objects:[
+   {o:"door",x:20,y:24,w:3,h:1,to:"mountain",tx:21,ty:2,label:"Howling Mount"},
+   {o:"door",x:0,y:12,w:1,h:3,to:"abyss",tx:40,ty:13,label:"The Abyss"},
+   {o:"chest",x:10,y:2,loot:"chest3"},
+   {o:"boss",x:34,y:18,r:7,boss:"skywarden",label:"Sky Warden"}],
+  spawns:[{x:6,y:4,w:30,h:16,types:["wraith","knight","bat"],n:6}]},
+ abyss:{base:"F",border:"W",track:"battle",rects:[
+   {t:"P",x:16,y:10,w:12,h:6},{t:"o",x:6,y:6},{t:"o",x:34,y:16},{t:"v",x:12,y:2},
+   {t:"v",x:30,y:20},{t:"L",x:2,y:20,w:5,h:4}],
+  sprinkle:[["o",6]],objects:[
+   {o:"door",x:42,y:12,w:1,h:3,to:"ruins",tx:2,ty:13,label:"Sky Ruins"},
+   {o:"door",x:20,y:0,w:3,h:1,to:"avatarRoom",tx:21,ty:18,label:"The Heart",need:"leviathan"},
+   {o:"herbNode",x:8,y:16},{o:"herbNode",x:36,y:6},
+   {o:"chest",x:4,y:2,loot:"chest4"},
+   {o:"boss",x:24,y:16,r:7,boss:"leviathan",label:"Leviathan"}]},
+ avatarRoom:{base:"F",border:"W",track:"boss",rects:[{t:"P",x:14,y:8,w:16,h:10}],
+  sprinkle:[],objects:[
+   {o:"door",x:20,y:24,w:3,h:1,to:"abyss",tx:21,ty:2,label:"The Abyss"},
+   {o:"boss",x:21,y:8,r:7,boss:"avatar",label:"Tidefall Avatar"}]}
+};
+let WORLD={grid:null,map:null,objects:[],npcs:[],enemies:[],cam:{x:0,y:0}};
+function buildMap(key){
+  const def=MAPS[key];
+  const g=[];for(let y=0;y<MH;y++){const row=[];for(let x=0;x<MW;x++)row.push(def.base);g.push(row);}
+  const fill=(t,x,y,w,h)=>{for(let yy=y;yy<y+h;yy++)for(let xx=x;xx<x+w;xx++)
+    if(xx>=0&&yy>=0&&xx<MW&&yy<MH)g[yy][xx]=t;};
+  for(const r of def.rects)fill(r.t,r.x,r.y,r.w,r.h);
+  // border
+  for(let x=0;x<MW;x++){g[0][x]=def.border;g[MH-1][x]=def.border;}
+  for(let y=0;y<MH;y++){g[y][0]=def.border;g[y][MW-1]=def.border;}
+  const sp=def.sprinkle||[];
+  for(let i=0;i<sp.length;i++){const t=sp[i][0],n=sp[i][1];
+    for(let k=0;k<n;k++){const x=1+rint(MW-2),y=1+rint(MH-2);
+      if(g[y][x]===def.base&&(x<3||x>MW-4||y<3||y>MH-4||t==="f"))g[y][x]=t;}}
+  WORLD.grid=g;WORLD.map=key;
+  WORLD.objects=def.objects.map(o=>{const c={...o,used:false};c.house=c.o==="house";c.shopstall=c.o==="shopstall";c.bench=c.o==="bench";return c;});
+  for(const o of WORLD.objects){
+    if(o.solid&&o.house){for(let yy=o.y;yy<o.y+2;yy++)for(let xx=o.x;xx<o.x+2;xx++)g[yy][xx]="r";}
+    else if(o.solid&&(o.save||o.shopstall||o.bench))g[o.y][o.x]="r";}
+  WORLD.npcs=(def.npcs||[]).map(id=>{const n=NPCS.find(n=>n.id===id);
+    return {...n,x:8+rint(28)*TS,y:8+rint(16)*TS};});
+  // fix npc positions to walkable tiles
+  for(const n of WORLD.npcs){let t=tileAt(n.x/TS|0,n.y/TS|0);let tries=0;
+    while(SOLID.has(t)&&tries++<40){n.x=(8+rint(28))*TS;n.y=(8+rint(16))*TS;t=tileAt(n.x/TS|0,n.y/TS|0);}}
+  WORLD.enemies=[];spawnEnemies();
+}
+function tileAt(tx,ty){if(tx<0||ty<0||tx>=MW||ty>=MH)return "W";return WORLD.grid[ty][tx];}
+function solidAt(px,py){const t=tileAt(px/TS|0,py/TS|0);return SOLID.has(t);}
+function boxSolid(x,y,w,h){return solidAt(x,y)||solidAt(x+w,y)||solidAt(x,y+h)||solidAt(x+w,y+h)
+  ||solidAt(x+w/2,y)||solidAt(x+w/2,y+h);}
+function spawnEnemies(){
+  const def=MAPS[WORLD.map];if(!def.spawns)return;
+  const ch=Game?Game.data.chapter:1;
+  for(const s of def.spawns){for(let i=0;i<s.n;i++){
+    const k=pick(s.types);const x=(s.x+rint(s.w))*TS,y=(s.y+rint(s.h))*TS;
+    if(!solidAt(x,y))WORLD.enemies.push(makeEnemy(k,x,y));}}
+}
+function makeEnemy(key,x,y){
+  const d=ENEMIES[key];const scale=1+(Game.data.chapter-1)*0.35+(Game.data.ngplus||0)*.5;
+  let art=key;const tint=MAP_TINT[WORLD.map];if(tint&&tint[key])art=tint[key];
+  return {key,art,x,y,w:12,h:12,hp:d.hp*scale,maxhp:d.hp*scale,dmg:d.dmg*(1+(Game.data.chapter-1)*.2),
+    spd:d.spd,xp:d.xp,ai:d.ai,drop:d.drop,t:0,st:"idle",cd:0,flash:0,slow:0,poison:0,burn:0,hurtT:0};
+}
+function camera(){
+  const tx=clamp(Game.player.x-VW/2,0,MW*TS-VW),ty=clamp(Game.player.y-VH/2,0,MH*TS-VH);
+  WORLD.cam.x=lerp(WORLD.cam.x,tx,.12);WORLD.cam.y=lerp(WORLD.cam.y,ty,.12);
+}
+// draw house / big objects
+function drawHouse(g,x,y){
+  g.drawImage(TILES.wall,x,y+8,32,24);
+  P(g,x-1,y,34,10,"#8a5a3f");P(g,x-2,y-2,36,4,"#a3724f");P(g,x-1,y+8,34,2,"#6a4430");
+  P(g,x+4,y+18,8,14,"#6e4a2f");P(g,x+5,y+19,6,12,"#8a6b45");P(g,x+10,y+24,2,2,"#f2c14e");
+  P(g,x+20,y+14,6,6,"#3d3852");P(g,x+21,y+15,4,4,"#ffd98a");P(g,x+20,y+14,6,1,"#6e4a2f");
+}
+
+// game.js - gameplay state and logic
+"use strict";
+const Game={data:null,player:null,proj:[],drops:[],boss:null,bossDef:null,
+  buffs:{atk:0,def:0,spd:0,anti:0},time:0,dialog:null,interact:null,msg:null,msgT:0,chapterCard:0,ending:null,
+  start(fresh){
+    this.data=Save.load();
+    if(this.data.weapons===undefined){this.data.weapons={sword1:true};}
+    buildArt();
+    this.player={x:this.data.px,y:this.data.py,w:10,h:8,dir:this.data.dir||"down",
+      hp:this.data.hp,anim:0,atkT:0,rollT:0,rollD:{x:0,y:0},inv:.5,dead:false,potT:0,swing:0};
+    this.proj=[];this.drops=[];this.boss=null;this.dialog=null;this.msg=null;
+    this.recalc();buildMap(this.data.map);
+    this.player.x=this.data.px;this.player.y=this.data.py;
+    this.syncQuests();
+    if(fresh!==false)this.showChapter();
+  },
+  recalc(){
+    const d=this.data;
+    const a=ARMORS.find(x=>x.id===d.armor),c=CLOAKS.find(x=>x.id===d.cloak),r=RINGS.find(x=>x.id===d.ring);
+    this.atk=(6+d.level*2+(WEAPONS[d.weapon]?WEAPONS[d.weapon].dmg:0))+(r&&r.atk||0);
+    this.def=(a?a.def:0)+(c&&c.def||0);
+    this.spd=62+(c?c.spd:0);
+    this.crit=r&&r.crit||0;
+    const hpMax=30+d.level*6+(r&&r.hp||0);
+    if(hpMax!==d.maxhp){const ratio=d.hp/d.maxhp;d.maxhp=hpMax;d.hp=Math.round(hpMax*ratio);}
+    this.hpMax=d.maxhp;
+  },
+  showChapter(){const c=CHAPTERS.find(c=>c.ch===this.data.chapter);
+    if(c){this.chapterCard=3;Audio.play(c.track);}},
+  syncQuests(){const q=this.data.quests;this.activeQuests=Object.keys(QUESTS).filter(k=>q[k]===1||q[k]===2);},
+  save(){const p=this.player;this.data.px=p.x;this.data.py=p.y;this.data.dir=p.dir;
+    this.data.hp=Math.min(p.hp,this.data.maxhp);Save.write();},
+  addXp(n){const d=this.data;d.xp+=n;const need=this.xpNeed();
+    if(d.xp>=need){d.xp-=need;d.level++;this.recalc();this.player.hp=this.hpMax;
+      Audio.sfx("level");FX.text(this.player.x,this.player.y-14,"LEVEL UP!","#f2c14e");
+      FX.burst(this.player.x,this.player.y,"#f2c14e",14,80);}},
+  xpNeed(){return 20+this.data.level*18;},
+  addItem(k,n){n=n||1;if(POTIONS[k])this.data.inv[k]=(this.data.inv[k]||0)+n;
+    else if(MAT_NAMES[k])this.data.mats[k]=(this.data.mats[k]||0)+n;},
+  hurt(n){const p=this.player;if(p.inv>0||p.dead)return;
+    let dmg=n-this.def;if(dmg<1)dmg=1;if(this.buffs.def>0)dmg=Math.ceil(dmg/2);
+    p.hp-=dmg;p.inv=.8;Audio.sfx("hurt");FX.doShake(4);
+    FX.text(p.x,p.y-12,"-"+dmg,"#ff6b6b");
+    if(p.hp<=0){p.hp=0;p.dead=true;Audio.sfx("die");}},
+  update(dt){
+    this.time+=dt;this.data.playtime+=dt;
+    for(const k in this.buffs)if(this.buffs[k]>0)this.buffs[k]-=dt;
+    const p=this.player;
+    if(p.inv>0)p.inv-=dt;if(p.atkT>0)p.atkT-=dt;if(p.rollT>0)p.rollT-=dt;
+    if(p.potT>0)p.potT-=dt;if(p.swing>0)p.swing-=dt;
+    if(p.dead)return;
+    const b=Input.consume();
+    if(b.menu&&!this.dialog){UI.togglePause();return;}
+    if(this.dialog){this.updateDialog(b);return;}
+    if(UI.mode){UI.update(b);return;}
+    let mx=Input.axes.x,my=Input.axes.y;
+    const l=Math.hypot(mx,my);if(l>1){mx/=l;my/=l;}
+    let spd=this.spd*(this.buffs.spd>0?1.4:1);
+    if(p.rollT>0){mx=p.rollD.x;my=p.rollD.y;spd=this.spd*2.1;}
+    if(l>.1&&p.rollT<=0){
+      if(Math.abs(mx)>Math.abs(my))p.dir=mx>0?"sideR":"sideL";else p.dir=my>0?"down":"up";}
+    this.moveBox(p,mx*spd*dt,my*spd*dt);
+    if(l>.1)p.anim+=dt*8;else p.anim=0;
+    if(b.a&&p.atkT<=0)this.attack();
+    if(b.b&&p.potT<=0)this.throwPotion();
+    for(const e of WORLD.enemies)this.upEnemy(e,dt);
+    if(this.boss)this.upBoss(dt);
+    // projectiles
+    for(let i=this.proj.length-1;i>=0;i--){const pr=this.proj[i];
+      pr.x+=pr.vx*dt;pr.y+=pr.vy*dt;pr.life-=dt;
+      let hit=false;
+      if(pr.ally){
+        if(this.boss&&!this.boss.dead&&dist(this.boss,pr)<22){hit=true;this.damage(this.boss,pr.dmg,pr.elem);}
+        else{const e=WORLD.enemies.find(e=>!e.dead&&dist(e,pr)<10);
+          if(e){hit=true;this.damage(e,pr.dmg,pr.elem);}}
+        if(hit&&pr.boom)this.boom(pr);}
+      else if(dist(p,pr)<9){hit=true;this.hurt(pr.dmg);}
+      if(pr.life<=0||hit){if(hit&&!pr.ally&&pr.boom)this.boom(pr);this.proj.splice(i,1);}}
+    // drops
+    for(let i=this.drops.length-1;i>=0;i--){const d=this.drops[i];
+      if(dist(p,d)<12){
+        if(d.gold){this.data.gold+=d.gold;Audio.sfx("coin");FX.text(d.x,d.y,"+"+d.gold+"g","#f2c14e");}
+        else{this.addItem(d.item);FX.text(d.x,d.y,MAT_NAMES[d.item]||"item","#8fe89a");}
+        this.drops.splice(i,1);}}
+    // interact target
+    this.interact=null;
+    for(const o of WORLD.objects){const ox=o.x*TS+8,oy=o.y*TS+8;
+      if(Math.abs(p.x-ox)<18&&Math.abs(p.y-oy)<18)this.interact={type:"obj",o};}
+    for(const n of WORLD.npcs)
+      if(Math.abs(p.x-n.x)<16&&Math.abs(p.y-n.y)<18)this.interact={type:"npc",n};
+    if(b.a&&this.interact&&p.atkT<=0){this.interactAction();p.atkT=.2;}
+    // object effects
+    for(const o of WORLD.objects){
+      if(o.herbNode&&o.used){o.t-=dt;if(o.t<=0)o.used=false;}
+      // doors
+      if(o.to){const ox=o.x*TS,oy=o.y*TS;
+        if(p.x>ox-4&&p.x<ox+(o.w||1)*TS+4&&p.y>oy-4&&p.y<oy+(o.h||1)*TS+4){
+          if(o.need&&!this.data.flags[o.need])continue;
+          this.goMap(o);break;}}}
+    if(this.msgT>0)this.msgT-=dt;
+  },
+  goMap(o){Audio.sfx("door");const self=this;
+    FX.fadeTo(()=>{buildMap(o.to);
+      self.player.x=o.tx*TS;self.player.y=o.ty*TS;
+      self.data.map=o.to;self.data.px=self.player.x;self.data.py=self.player.y;self.save();
+      const tr=MAPS[o.to].track;Audio.play(tr);FX.fadeDir=-1;});},
+  moveBox(o,dx,dy){
+    if(dx){const nx=o.x+dx;if(!boxSolid(nx-o.w/2,o.y-o.h/2,o.w,o.h))o.x=nx;}
+    if(dy){const ny=o.y+dy;if(!boxSolid(o.x-o.w/2,ny-o.h/2,o.w,o.h))o.y=ny;}},
+  attack(){
+    const p=this.player,w=WEAPONS[this.data.weapon];
+    p.atkT=w.cd;p.swing=.18;Audio.sfx("swing");
+    const dx=p.dir==="sideR"?1:p.dir==="sideL"?-1:0,dy=p.dir==="down"?1:p.dir==="up"?-1:0;
+    const cx=p.x+dx*w.range*.8,cy=p.y+dy*w.range*.8;
+    if(w.type==="ranged"){this.proj.push({x:cx,y:cy,vx:dx*150,vy:dy*150,dmg:this.atk,life:.6,ally:1,elem:"bolt"});return;}
+    if(w.type==="bomb"){this.proj.push({x:cx,y:cy,vx:dx*95,vy:dy*95,dmg:w.dmg,life:.7,ally:1,boom:1,elem:"fire"});return;}
+    const tg=this.boss&&!this.boss.dead?[this.boss]:WORLD.enemies.filter(e=>!e.dead);
+    for(const e of tg)if(dist({x:cx,y:cy},e)<(e.big?26:15))this.damage(e,this.atk);},
+  damage(e,base,elem){
+    let d=base*(this.buffs.atk>0?1.5:1);
+    const crit=Math.random()<this.crit;if(crit)d*=1.8;
+    e.hp-=d;e.flash=.15;Audio.sfx(crit?"crit":"hit");
+    FX.text(e.x,e.y-14,""+Math.round(d)+(crit?"!":""),crit?"#f2d16b":"#fff");
+    FX.burst(e.x,e.y,elem==="fire"?"#ff9a4d":elem==="frost"?"#8fc9ff":"#e8ecfc",5,50);
+    if(!e.big&&e.hp<=0&&!e.dead){e.dead=true;this.killReward(e);}
+    if(e.big&&elem==="frost")e.slow=3;
+    if(!e.big&&elem==="frost")e.slow=3;},
+  killReward(e){const d=this.data;d.kills++;this.addXp(e.xp);
+    this.drops.push({x:e.x,y:e.y,gold:3+rint(6)});
+    if(e.drop&&Math.random()<e.drop[1])this.drops.push({x:e.x+6,y:e.y+4,item:e.drop[0]});
+    FX.burst(e.x,e.y,"#8f6bb8",10,70);this.questKill(e.key);
+    setTimeout(()=>{const i=WORLD.enemies.indexOf(e);if(i>=0)WORLD.enemies.splice(i,1);},250);},
+  boom(pr){Audio.sfx("hit");FX.burst(pr.x,pr.y,"#ff9a4d",16,90);FX.doShake(3);
+    const tg=this.boss&&!this.boss.dead?[this.boss]:WORLD.enemies.filter(e=>!e.dead);
+    for(const e of tg)if(dist(e,pr)<26){
+      if(pr.elem==="frost")e.slow=3;
+      if(pr.elem==="venom")e.poison=4;
+      if(pr.elem==="fire")e.burn=3;
+      if(pr.elem==="shock"){for(const o of tg)if(o!==e&&dist(o,e)<30)o.hp-=pr.dmg*.5;}
+      this.damage(e,pr.dmg*.9,pr.elem);}
+    if(!pr.ally)this.hurtArea(pr.x,pr.y,22,pr.dmg);},
+  throwPotion(){
+    const p=this.player;
+    const opts=["potion_fire","potion_frost","potion_shock","potion_venom"];
+    const have=opts.filter(k=>this.data.inv[k]>0);
+    if(!have.length){
+      if(this.data.inv.potion_heal>0)this.usePotion("potion_heal");
+      else if(this.data.inv.potion_majheal>0)this.usePotion("potion_majheal");
+      return;}
+    const k=this.data.curPot&&this.data.inv[this.data.curPot]>0?this.data.curPot:have[0];
+    this.usePotion(k);},
+  usePotion(k){const d=this.data,p=this.player;
+    if(!POTIONS[k]||d.inv[k]<=0)return;
+    d.inv[k]--;Audio.sfx("potion");p.potT=.4;
+    const u=POTIONS[k].use;
+    if(u==="heal15"){p.hp=Math.min(this.hpMax,p.hp+15);FX.text(p.x,p.y-14,"+15","#8fe89a");}
+    else if(u==="heal40"){p.hp=Math.min(this.hpMax,p.hp+40);FX.text(p.x,p.y-14,"+40","#8fe89a");}
+    else if(u==="buff_atk")this.buffs.atk=20;
+    else if(u==="buff_def")this.buffs.def=20;
+    else if(u==="buff_spd")this.buffs.spd=15;
+    else if(u==="anti")this.buffs.anti=20;
+    else{const dx=p.dir==="sideR"?1:p.dir==="sideL"?-1:0,dy=p.dir==="down"?1:p.dir==="up"?-1:0;
+      this.proj.push({x:p.x+dx*10,y:p.y+dy*10,vx:dx*115,vy:dy*115,dmg:10,life:.8,ally:1,boom:1,elem:u.replace("throw_","")});}},
+  upEnemy(e,dt){
+    if(e.dead)return;const p=this.player;
+    if(e.flash>0)e.flash-=dt;
+    if(e.slow>0){e.slow-=dt;e.t+=dt*.5;}else e.t+=dt;
+    const d=dist(e,p);const aggro=d<130;
+    let vx=0,vy=0;
+    if(e.ai==="chase"&&aggro){vx=Math.sign(p.x-e.x);vy=Math.sign(p.y-e.y);}
+    else if(e.ai==="drift"&&aggro){
+      if(e.cd<=0&&d<85){e.cd=1.6;this.eshoot(e,p,45);}
+      vx=Math.cos(e.t*2)*.5;vy=Math.sin(e.t*2)*.5;}
+    else if(e.ai==="swoop"&&aggro){const a=Math.atan2(p.y-e.y,p.x-e.x)+Math.sin(e.t*4)*.8;
+      vx=Math.cos(a);vy=Math.sin(a);}
+    else if(e.ai==="phase"&&aggro){vx=Math.sign(p.x-e.x)*.8;vy=Math.sign(p.y-e.y)*.8;}
+    else if(e.ai==="charge"&&aggro){
+      if(e.st!=="dash"){e.t2=(e.t2||0)+dt;
+        if(e.t2>.6){e.st="dash";e.t2=0;e.da=Math.atan2(p.y-e.y,p.x-e.x);}}
+      if(e.st==="dash"){vx=Math.cos(e.da)*2.4;vy=Math.sin(e.da)*2.4;e.t2+=dt;if(e.t2>.4){e.st="wind";e.t2=0;}}}
+    else if(e.ai==="turret"&&aggro){if(e.cd<=0&&d<100){e.cd=2;this.eshoot(e,p,60);}}
+    else if(e.ai==="bomber"&&aggro&&d<36){e.dead=true;this.boom({x:e.x,y:e.y,dmg:e.dmg,ally:0,elem:"fire"});this.killReward(e);return;}
+    else if(e.ai==="lunge"&&aggro){
+      if(e.cd<=0&&d<75){e.cd=1.4;e.da=Math.atan2(p.y-e.y,p.x-e.x);e.st="l";e.t2=0;}
+      if(e.st==="l"){vx=Math.cos(e.da)*2.6;vy=Math.sin(e.da)*2.6;e.t2+=dt;if(e.t2>.4)e.st="idle";}}
+    if(e.cd>0)e.cd-=dt;
+    if(e.poison>0){e.poison-=dt;e.hp-=4*dt;}
+    if(e.burn>0){e.burn-=dt;e.hp-=6*dt;}
+    if(e.hp<=0&&!e.dead){e.dead=true;this.killReward(e);return;}
+    const sp=e.spd*(e.slow>0?.4:1)*dt;
+    if(vx||vy)this.moveBox(e,vx*sp,vy*sp);
+    if(d<10)this.hurt(e.dmg);},
+  eshoot(e,p,spd){const a=Math.atan2(p.y-e.y,p.x-e.x);
+    this.proj.push({x:e.x,y:e.y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,dmg:e.dmg,life:1.6,ally:0,elem:"zap"});},
+  hurtArea(x,y,r,dmg){if(dist(this.player,{x:x,y:y})<r)this.hurt(dmg);},
+  startBoss(id){const def=BOSSES.find(b=>b.id===id);if(!def)return;
+    const ng=1+(this.data.ngplus||0)*.6;
+    this.bossDef=def;
+    this.boss={big:1,key:def.id,x:this.player.x+50,y:this.player.y-30,w:28,h:22,
+      hp:def.hp*ng,maxhp:def.hp*ng,dmg:def.dmg,t:0,cd:1.2,phase:1,flash:0,spd:20,dead:false,vx:0,vy:0};
+    Audio.sfx("boss");Audio.play("boss");this.msg="!! "+def.name+" !!";this.msgT=2.5;FX.doShake(6);},
+  upBoss(dt){const B=this.boss,p=this.player;if(B.dead)return;
+    B.t+=dt;if(B.flash>0)B.flash-=dt;if(B.cd>0)B.cd-=dt;
+    const ph=B.hp/B.maxhp<.5?2:1;
+    if(ph===2&&B.phase===1){B.phase=2;this.msg=this.bossDef.name+" is enraged!";this.msgT=2;Audio.sfx("boss");}
+    const a=Math.atan2(p.y-B.y,p.x-B.x);
+    if(B.cd<=0){const pat=pick(this.bossDef.pat);
+      switch(pat){
+        case "hop":B.vx=Math.cos(a)*3;B.vy=Math.sin(a)*3;B.cd=1.2;FX.doShake(3);break;
+        case "spit":for(let i=-1;i<=1;i++){const aa=a+i*.3;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*70,vy:Math.sin(aa)*70,dmg:B.dmg*.7,life:2,ally:0,elem:"venom",boom:1});}B.cd=1.6;break;
+        case "spawn":for(let i=0;i<2;i++)WORLD.enemies.push(makeEnemy("spore",B.x+rint(60)-30,B.y+rint(40)-20));B.cd=2.5;break;
+        case "spores":for(let i=0;i<8;i++){const aa=i/8*6.283;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*60,vy:Math.sin(aa)*60,dmg:B.dmg*.6,life:1.4,ally:0});}B.cd=2;break;
+        case "charge":B.vx=Math.cos(a)*4;B.vy=Math.sin(a)*4;B.cd=1.4;break;
+        case "slam":this.hurtArea(B.x,B.y,42,B.dmg);FX.burst(B.x,B.y,"#9aa7c0",18,110);FX.doShake(6);B.cd=1.8;break;
+        case "shockwave":for(let i=0;i<12;i++){const aa=i/12*6.283;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*85,vy:Math.sin(aa)*85,dmg:B.dmg*.8,life:1.2,ally:0,elem:"zap"});}B.cd=2.2;break;
+        case "bolt":const self=this;for(let i=0;i<3;i++)setTimeout(()=>{if(self.boss&&!self.boss.dead)self.proj.push({x:p.x+rint(24)-12,y:p.y-50,vx:0,vy:130,dmg:B.dmg,life:1,ally:0,elem:"zap"});},i*180);B.cd=2;break;
+        case "dive":B.vx=Math.cos(a)*4.5;B.vy=Math.sin(a)*4.5;B.cd=1.5;break;
+        case "gale":for(let i=0;i<6;i++)this.proj.push({x:B.x,y:B.y+8,vx:Math.cos(a)*100,vy:(i-3)*22,dmg:B.dmg*.7,life:1.3,ally:0});B.cd=1.7;break;
+        case "summon":for(let i=0;i<3;i++)WORLD.enemies.push(makeEnemy("bat",B.x+rint(50)-25,B.y+rint(30)-15));B.cd=3;break;
+        case "coil":B.vx=Math.cos(a)*2.5;B.vy=Math.sin(a)*2.5;B.cd=1;break;
+        case "tidewave":for(let i=-2;i<=2;i++){const aa=a+i*.25;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*75,vy:Math.sin(aa)*75,dmg:B.dmg*.8,life:2,ally:0,elem:"venom",boom:1});}B.cd=2.4;break;
+        case "spiral":B.spT=(B.spT||0)+.6;for(let i=0;i<2;i++){const aa=B.spT+i*3.14;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*65,vy:Math.sin(aa)*65,dmg:B.dmg*.6,life:1.8,ally:0});}B.cd=.4;break;
+        case "wave":for(let i=0;i<10;i++){const aa=i/10*6.283+B.t;
+          this.proj.push({x:B.x,y:B.y,vx:Math.cos(aa)*70,vy:Math.sin(aa)*70,dmg:B.dmg*.7,life:1.6,ally:0,elem:"venom"});}B.cd=2.6;break;}}
+    if(B.vx||B.vy){this.moveBox(B,B.vx*22*dt,B.vy*22*dt);B.vx*=.9;B.vy*=.9;}
+    if(dist(B,p)<20)this.hurt(B.dmg*.8);
+    if(B.hp<=0){B.dead=true;this.bossDown();}},
+  bossDown(){const def=this.bossDef,d=this.data;
+    this.addXp(def.xp);d.gold+=def.reward.gold;
+    FX.burst(this.boss.x,this.boss.y,"#f2c14e",30,120);FX.doShake(8);Audio.sfx("level");
+    this.msg=def.name+" defeated!";this.msgT=3;
+    if(def.reward.armor)this.gainGear("armor",def.reward.armor);
+    if(def.reward.cloak)this.gainGear("cloak",def.reward.cloak);
+    if(def.reward.ring)this.gainGear("ring",def.reward.ring);
+    if(def.reward.weapon){d.weapons[def.reward.weapon]=true;d.weapon=def.reward.weapon;}
+    if(def.ch===5){d.inv.potion_tide=(d.inv.potion_tide||0)+1;
+      this.msg="The Essence of Tide condenses in your flask.";this.msgT=3;}
+    if(def.ch>=6){this.finale();return;}
+    d.flags["boss_"+def.ch]=true;d.chapter=Math.max(d.chapter,def.ch+1);
+    this.boss=null;this.save();this.showChapter();},
+  finale(){this.boss=null;this.save();const d=this.data;const harm=this.harmony();
+    if((d.inv.potion_tide||0)>0){const self=this;
+      this.say(["The Avatar's core lies bare. The Essence of Tide glows in your satchel.",
+        "Purge the sea forever, or bind its heart and walk away?"],
+        [{t:"Pour the Essence (purge)",f:function(){self.end("healed",harm);}},
+         {t:"Bind it in the flask (contain)",f:function(){self.end("contained",harm);}}]);}
+    else this.end("lost",0);},
+  end(key,harm){
+    if(key==="healed"&&harm<3)key="contained";
+    this.data.avatarDone=true;this.data.ending=key;this.data.ngplusDone=true;Save.write();
+    Audio.stop();Scenes.switchTo({update:function(dt){Input.poll();if(Input.consume().a)UI.titleScene();},
+      render:function(){UI.renderEnding(key);}});},
+  harmony(){let n=0;for(const k in QUESTS)if(this.data.quests[k]===2)n++;return n;},
+  questKill(key){const d=this.data;
+    for(const qk of this.activeQuests){const q=QUESTS[qk];
+      if(d.quests[qk]===1&&q.need.kill===key){
+        d.qprog=d.qprog||{};d.qprog[qk]=(d.qprog[qk]||0)+1;
+        if(d.qprog[qk]>=q.need.n){d.quests[qk]=2;this.msg="Quest complete: "+q.title;this.msgT=3;}}}},
+  gainGear(slot,id){this.data[slot]=id;this.recalc();},
+  interactAction(){
+    const it=this.interact;if(!it)return;
+    if(it.type==="npc"){const n=it.n;
+      if(n.role==="shop"){UI.openShop("bram");return;}
+      if(n.role==="shop2"){UI.openShop("ivy");return;}
+      if(n.role==="gate"){const d=this.data;
+        this.say(["Gatekeeper: The wilds rank east to west, young one.",
+          "Fell each island's master and I open the next path.",
+          d.flags.boss_5?"The Heart lies open. Go, and choose well.":"Fell the Leviathan and the Heart will open."]);return;}
+      if(n.quest){const st=this.data.quests[n.quest]||0;const q=QUESTS[n.quest];
+        if(st===0){this.data.quests[n.quest]=1;this.syncQuests();
+          this.say([n.name+": "+q.txt,"Quest accepted."]);return;}
+        if(st===1){
+          if(q.need.mat&&(this.data.mats[q.need.mat]||0)>=q.need.n){
+            this.data.mats[q.need.mat]-=q.need.n;this.data.quests[n.quest]=2;
+            this.grantReward(q.reward);this.syncQuests();
+            this.say([n.name+": These are perfect. Take this."]);return;}
+          if(q.need.item&&this.data.itemBook){this.data.quests[n.quest]=2;
+            this.grantReward(q.reward);this.syncQuests();
+            this.say([n.name+": You found it! Thank you."]);return;}
+          this.say([n.name+": "+q.txt]);return;}
+        if(st===2){this.data.quests[n.quest]=3;this.grantReward(q.reward);this.syncQuests();
+          this.say([n.name+": You actually did it. Take this."]);return;}}
+      this.say(n.lines.map(function(l){return n.name+": "+l;}));return;}
+    const o=it.o;
+    if(o.save){this.save();this.say(["The shrine hums. Your journey is remembered."]);return;}
+    if(o.corrupt){
+      if(this.data.inv.potion_cleanse>0){this.data.inv.potion_cleanse--;o.corrupt=false;
+        this.data.shrines=(this.data.shrines||0)+1;Audio.sfx("brew");
+        FX.burst(o.x*TS+8,o.y*TS+8,"#a8f0e0",20,90);
+        this.say(["The shrine clears. Violet drains from its stone."]);
+        if(this.data.shrines>=3)for(const qk in QUESTS)
+          if(this.data.quests[qk]===1&&QUESTS[qk].need.shrines){this.data.quests[qk]=2;this.syncQuests();}}
+      else this.say(["A corrupted shrine. It wants a Cleansing Draught."]);return;}
+    if(o.shop){UI.openShop(o.shop);return;}
+    if(o.bench){UI.openCraft();return;}
+    if(o.loot&&!o.used){o.used=true;this.openChest(o);return;}
+    if(o.boss&&!o.used){const d=this.data;
+      const def=BOSSES.find(b=>b.id===o.boss);
+      if(def.ch>d.chapter){this.say(["A great shadow bars the way. (Progress the story first.)"]);return;}
+      if(o.boss==="avatar"&&!d.flags.boss_5){this.say(["The Heart is sealed. Fell the Leviathan first."]);return;}
+      if(o.boss==="avatar"&&d.avatarDone){this.say(["The Heart is quiet now."]);return;}
+      o.used=true;this.startBoss(o.boss);return;}
+    if(o.herbNode&&!o.used){o.used=true;o.t=10;this.addItem("herb");Audio.sfx("coin");
+      FX.text(o.x*TS+8,o.y*TS,"+herb","#8fe89a");}},
+  openChest(o){const loot=CHESTS[o.loot]||CHESTS.chest1;
+    Audio.sfx("confirm");FX.burst(o.x*TS+8,o.y*TS+8,"#f2c14e",12,70);
+    const got=[];
+    if(loot.gold){this.data.gold+=loot.gold;got.push(loot.gold+" gold");}
+    if(loot.potion){this.data.inv[loot.potion]=(this.data.inv[loot.potion]||0)+1;got.push(POTIONS[loot.potion].name);}
+    if(loot.armor){this.gainGear("armor",loot.armor);got.push(ARMORS.find(a=>a.id===loot.armor).name);}
+    if(loot.cloak){this.gainGear("cloak",loot.cloak);got.push(CLOAKS.find(c=>c.id===loot.cloak).name);}
+    if(loot.weapon){this.data.weapons[loot.weapon]=true;got.push(WEAPONS[loot.weapon].name);}
+    if(loot.mats)for(const k in loot.mats){this.data.mats[k]+=loot.mats[k];got.push(loot.mats[k]+" "+MAT_NAMES[k]);}
+    if(loot.item==="chest_book")got.push("Mira's recipe book");
+    if(loot.item==="chest_boat")got.push("Pip's toy boat");
+    this.say(["Inside: "+got.join(", ")+"."]);},
+  grantReward(r){const got=[];
+    if(r.gold){this.data.gold+=r.gold;got.push(r.gold+" gold");}
+    if(r.armor){this.gainGear("armor",r.armor);got.push(ARMORS.find(a=>a.id===r.armor).name);}
+    if(r.cloak){this.gainGear("cloak",r.cloak);got.push(CLOAKS.find(c=>c.id===r.cloak).name);}
+    if(r.ring){this.gainGear("ring",r.ring);got.push(RINGS.find(x=>x.id===r.ring).name);}
+    if(r.weapon){this.data.weapons[r.weapon]=true;got.push(WEAPONS[r.weapon].name);}
+    if(r.potion)for(const k in r.potion){this.data.inv[k]=(this.data.inv[k]||0)+r.potion[k];got.push(POTIONS[k].name+" x"+r.potion[k]);}
+    Audio.sfx("level");if(got.length){this.msg="Received: "+got.join(", ");this.msgT=3;}},
+  say(lines,opts){this.dialog={lines:lines.slice(),i:0,opts:opts||null};},
+  updateDialog(b){const dl=this.dialog;
+    if(dl.opts){if(b.a){const o=dl.opts[dl.i];this.dialog=null;o.f();}return;}
+    if(b.a){Audio.sfx("menu");dl.i++;if(dl.i>=dl.lines.length)this.dialog=null;}}
+};
+const CHESTS={
+ chest1:{gold:40,potion:"potion_heal",mats:{herb:2}},
+ chest_book:{item:"chest_book",gold:10},
+ chest_boat:{item:"chest_boat"},
+ chest2:{gold:80,weapon:"spear1",mats:{salt:2}},
+ chest3:{gold:120,armor:"armor2",mats:{crystal:2}},
+ chest4:{gold:200,potion:"potion_majheal",mats:{pearl:1,ash:2}}};
+
+// ui.js - HUD, dialogue, menus, shops, crafting, inventory, map, endings
+"use strict";
+const UI={mode:null,sel:0,shop:null,shopTab:0,craftSel:0,invSel:0,pauseSel:0,titleSel:0,
+  togglePause(){Audio.sfx("menu");this.mode=this.mode?null:"pause";this.pauseSel=0;},
+  update(b){
+    if(b.menu){this.mode=null;return;}
+    const n=(d,arr)=>{if(b.b){Audio.sfx("cancel");this.mode=null;return;}
+      if(b.up)this.sel=(this.sel-d+arr)%arr;if(b.down)this.sel=(this.sel+d)%arr;};
+    // use Input.axes from poll: derive up/down/a handled by caller passing b; axis taps:
+    if(this.mode==="pause"){const arr=5;
+      if(Input.axes.y<-.5&&!this._uy){this.pauseSel=(this.pauseSel-1+arr)%arr;Audio.sfx("menu");this._uy=1;}
+      if(Input.axes.y>.5&&!this._dy){this.pauseSel=(this.pauseSel+1)%arr;Audio.sfx("menu");this._dy=1;}
+      if(!Input.axes.y){this._uy=0;this._dy=0;}
+      if(b.a){Audio.sfx("confirm");
+        if(this.pauseSel===0)this.mode=null;
+        else if(this.pauseSel===1){this.mode="inv";this.invSel=0;}
+        else if(this.pauseSel===2){this.mode="quest";}
+        else if(this.pauseSel===3){this.mode="map";}
+        else if(this.pauseSel===4){this.mode=null;UI.titleScene();}}
+      return;}
+    if(this.mode==="inv"){this.updInv(b);return;}
+    if(this.mode==="quest"){if(b.a||b.b){Audio.sfx("cancel");this.mode="pause";}return;}
+    if(this.mode==="shop"){this.updShop(b);return;}
+    if(this.mode==="craft"){this.updCraft(b);return;}
+    if(this.mode==="map"){if(b.a||b.b){Audio.sfx("cancel");this.mode=null;}return;}
+  },
+  updInv(b){
+    const rows=this.invRows();
+    if(Input.axes.y<-.5&&!this._uy){this.invSel=(this.invSel-1+rows.length)%rows.length;Audio.sfx("menu");this._uy=1;}
+    if(Input.axes.y>.5&&!this._dy){this.invSel=(this.invSel+1)%rows.length;Audio.sfx("menu");this._dy=1;}
+    if(!Input.axes.y){this._uy=0;this._dy=0;}
+    if(b.b){Audio.sfx("cancel");this.mode="pause";return;}
+    if(b.a&&rows[this.invSel])rows[this.invSel].act();},
+  invRows(){const d=Game.data,rows=[];
+    // weapons
+    for(const line of WEAPON_LINES)for(const id of line)if(d.weapons[id])
+      rows.push({t:WEAPONS[id].name+(d.weapon===id?" [held]":""),act:()=>{d.weapon=id;Game.recalc();Audio.sfx("confirm");}});
+    for(const k in d.inv)if(POTIONS[k]&&d.inv[k]>0)
+      rows.push({t:POTIONS[k].name+" x"+d.inv[k],act:()=>{Game.usePotion(k);}});
+    if(d.armor)rows.push({t:"Armor: "+ARMORS.find(a=>a.id===d.armor).name,act:()=>{}});
+    if(d.cloak)rows.push({t:"Cloak: "+CLOAKS.find(c=>c.id===d.cloak).name,act:()=>{}});
+    if(d.ring)rows.push({t:"Ring: "+RINGS.find(r=>r.id===d.ring).name,act:()=>{}});
+    for(const k in d.mats)if(d.mats[k]>0)rows.push({t:MAT_NAMES[k]+" x"+d.mats[k],act:()=>{}});
+    if(!rows.length)rows.push({t:"(empty)",act:()=>{}});
+    return rows;},
+  openShop(id){this.mode="shop";this.shop=id;this.shopTab=0;this.sel=0;
+    this.rows=this.shop==="bram"?this.bramRows():this.ivyRows();Audio.sfx("confirm");},
+  bramRows(){const d=Game.data,rows=[];
+    for(const line of WEAPON_LINES){const i=line.indexOf(d.weapon);
+      if(i>=0&&i<2){const id=line[i+1];
+        rows.push({t:"Upgrade to "+WEAPONS[id].name+" ("+WEAPONS[id].cost+"g)",act:()=>this.buy(id,WEAPONS[id].cost,g=>{g.weapons[id]=true;g.weapon=id;Game.recalc();})});}}
+    for(const a of ARMORS)if(!d.armor||ARMORS.findIndex(x=>x.id===d.armor)<ARMORS.findIndex(x=>x.id===a.id))
+      if(a.cost>0)rows.push({t:"Armor: "+a.name+" ("+a.cost+"g)",act:()=>this.buy(a.id,a.cost,g=>{g.armor=a.id;Game.recalc();})});
+    for(const c of CLOAKS)if(c.cost>0&&(!d.cloak||CLOAKS.findIndex(x=>x.id===d.cloak)<CLOAKS.findIndex(x=>x.id===c.id)))
+      rows.push({t:"Cloak: "+c.name+" ("+c.cost+"g)",act:()=>this.buy(c.id,c.cost,g=>{g.cloak=c.id;Game.recalc();})});
+    if(!d.ring)rows.push({t:"Ring: "+RINGS[0].name+" ("+RINGS[0].cost+"g)",act:()=>this.buy(RINGS[0].id,RINGS[0].cost,g=>{g.ring=RINGS[0].id;Game.recalc();})});
+    if(!rows.length)rows.push({t:"(nothing left to sell you)",act:()=>{}});
+    return rows;},
+  ivyRows(){const rows=[];
+    for(const k in POTIONS)if(POTIONS[k].cost>0)
+      rows.push({t:POTIONS[k].name+" ("+POTIONS[k].cost+"g)",act:()=>this.buy(k,POTIONS[k].cost,g=>{g.inv[k]=(g.inv[k]||0)+1;})});
+    return rows;},
+  buy(id,cost,fn){const d=Game.data;
+    if(d.gold<cost){Game.msg="Not enough gold.";Game.msgT=1.5;Audio.sfx("cancel");return;}
+    d.gold-=cost;fn(d);Audio.sfx("coin");Game.msg="Bought!";Game.msgT=1.2;Game.save();},
+  updShop(b){
+    if(Input.axes.y<-.5&&!this._uy){this.sel=Math.max(0,this.sel-1);Audio.sfx("menu");this._uy=1;}
+    if(Input.axes.y>.5&&!this._dy){this.sel=Math.min(this.rows.length-1,this.sel+1);Audio.sfx("menu");this._dy=1;}
+    if(!Input.axes.y){this._uy=0;this._dy=0;}
+    if(b.b){Audio.sfx("cancel");this.mode=null;return;}
+    if(b.a&&this.rows[this.sel]){this.rows[this.sel].act();}},
+  openCraft(){this.mode="craft";this.craftSel=0;
+    this.rows=Object.keys(POTIONS).map(k=>({k,r:POTIONS[k]}));Audio.sfx("confirm");},
+  updCraft(b){
+    if(Input.axes.y<-.5&&!this._uy){this.craftSel=(this.craftSel-1+this.rows.length)%this.rows.length;Audio.sfx("menu");this._uy=1;}
+    if(Input.axes.y>.5&&!this._dy){this.craftSel=(this.craftSel+1)%this.rows.length;Audio.sfx("menu");this._dy=1;}
+    if(!Input.axes.y){this._uy=0;this._dy=0;}
+    if(b.b){Audio.sfx("cancel");this.mode=null;return;}
+    if(b.a){const r=this.rows[this.craftSel],d=Game.data;
+      if(!d.recipes.includes(r.k)&&r.k!=="potion_cleanse"&&r.k!=="potion_tide"){Game.msg="Recipe unknown yet.";Game.msgT=1.5;Audio.sfx("cancel");return;}
+      for(const m in r.r.recipe)if((d.mats[m]||0)<r.r.recipe[m]){Game.msg="Missing materials.";Game.msgT=1.5;Audio.sfx("cancel");return;}
+      for(const m in r.r.recipe)d.mats[m]-=r.r.recipe[m];
+      if(!d.recipes.includes(r.k))d.recipes.push(r.k);
+      d.inv[r.k]=(d.inv[r.k]||0)+1;Audio.sfx("brew");
+      Game.msg="Brewed "+r.r.name+"!";Game.msgT=1.5;Game.save();}},
+  // ------- rendering -------
+  panel(x,y,w,h){ctx.fillStyle="rgba(12,10,24,.92)";ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle="#f2c14e";ctx.lineWidth=1;ctx.strokeRect(x+.5,y+.5,w-1,h-1);},
+  drawText(t,x,y,col,font){ctx.fillStyle=col||"#fff";ctx.font=font||"8px monospace";ctx.textAlign="left";ctx.fillText(t,x,y);},
+  renderHUD(){
+    const d=Game.data,p=Game.player;
+    // hearts bar
+    ctx.fillStyle="rgba(0,0,0,.5)";ctx.fillRect(4,4,86,12);
+    for(let i=0;i<d.maxhp;i+=5){const frac=clamp((p.hp-i)/5,0,1);
+      ctx.fillStyle="#3a2a35";ctx.fillRect(7+i*1.6,7,7,6);
+      ctx.fillStyle="#e84a5a";ctx.fillRect(7+i*1.6,7,7*frac,6);}
+    this.drawText("Lv "+d.level+"  "+d.gold+"g",6,26,"#f2c14e");
+    // buffs
+    let by=32;for(const k in Game.buffs)if(Game.buffs[k]>0){
+      this.drawText({atk:"ATK UP",def:"DEF UP",spd:"SPEED",anti:"ANTIVENOM"}[k]+" "+Math.ceil(Game.buffs[k])+"s",6,by,"#7df0dd");by+=9;}
+    // current throwable
+    const throwables=["potion_fire","potion_frost","potion_shock","potion_venom"].filter(k=>d.inv[k]>0);
+    if(throwables.length){const k=d.curPot&&d.inv[d.curPot]?d.curPot:throwables[0];
+      ctx.drawImage(potionIcon(POT_COLORS[k]),VW-70,4);
+      this.drawText("x"+d.inv[k],VW-58,12,"#fff");}
+    // interact hint
+    if(Game.interact&&!Game.dialog&&!this.mode){this.drawText("[A] "+(Game.interact.type==="npc"?Game.interact.n.name:"use"),VW/2-30,VH-40,"#f2c14e");}
+    // boss hp
+    if(Game.boss&&!Game.boss.dead){const B=Game.boss;
+      ctx.fillStyle="rgba(0,0,0,.6)";ctx.fillRect(VW/2-80,18,160,10);
+      ctx.fillStyle="#e84a5a";ctx.fillRect(VW/2-78,20,156*clamp(B.hp/B.maxhp,0,1),6);
+      ctx.textAlign="center";ctx.fillStyle="#fff";ctx.font="8px monospace";ctx.fillText(Game.bossDef.name,VW/2,16);}
+    // msg
+    if(Game.msgT>0){ctx.textAlign="center";ctx.fillStyle="#f2c14e";ctx.font="9px monospace";
+      ctx.fillText(Game.msg,VW/2,40);}
+    // touch controls
+    if(Input.tOn){
+      ctx.globalAlpha=.35;
+      ctx.beginPath();ctx.arc(34,VH-36,20,0,6.283);ctx.stroke();
+      ctx.beginPath();ctx.arc(34+Input.axes.x*14,VH-36+Input.axes.y*14,8,0,6.283);ctx.fill();
+      ctx.beginPath();ctx.arc(VW-30,VH-30,14,0,6.283);ctx.stroke();ctx.fillText("A",VW-33,VH-27);
+      ctx.beginPath();ctx.arc(VW-30,VH-80,12,0,6.283);ctx.stroke();ctx.fillText("B",VW-33,VH-77);
+      ctx.globalAlpha=1;}
+  },
+  render(){
+    if(this.mode==="pause")return this.renderPause();
+    if(this.mode==="inv")return this.renderInv();
+    if(this.mode==="quest")return this.renderQuest();
+    if(this.mode==="shop")return this.renderShop();
+    if(this.mode==="craft")return this.renderCraft();
+    if(this.mode==="map")return this.renderMapScreen();
+  },
+  renderPause(){ctx.fillStyle="rgba(6,4,12,.7)";ctx.fillRect(0,0,VW,VH);
+    this.panel(VW/2-60,60,120,120);
+    this.drawText("PAUSED",VW/2-24,76,"#f2c14e","bold 10px monospace");
+    ["Resume","Inventory","Quest log","Map","Quit to title"].forEach((t,i)=>{
+      this.drawText((this.pauseSel===i?"> ":"  ")+t,VW/2-48,96+i*16,this.pauseSel===i?"#f2c14e":"#cbb6e2");});
+    this.drawText("HP "+Math.ceil(Game.player.hp)+"/"+Game.hpMax+"  ATK "+Math.round(Game.atk)+"  DEF "+Game.def,VW/2-64,166,"#8ff0e8");},
+  renderInv(){ctx.fillStyle="rgba(6,4,12,.85)";ctx.fillRect(0,0,VW,VH);
+    this.panel(40,20,VW-80,VH-40);
+    this.drawText("INVENTORY",56,34,"#f2c14e","bold 10px monospace");
+    const rows=this.invRows();
+    rows.forEach((r,i)=>{if(i>this.invSel-10&&i<this.invSel+10)
+      this.drawText((this.invSel===i?"> ":"  ")+r.t,56,50+i*12,this.invSel===i?"#f2c14e":"#cbb6e2");});
+    this.drawText("[A] use/equip  [B] back",56,VH-32,"#6a5a80");},
+  renderQuest(){ctx.fillStyle="rgba(6,4,12,.85)";ctx.fillRect(0,0,VW,VH);
+    this.panel(40,20,VW-80,VH-40);
+    this.drawText("QUEST LOG",56,34,"#f2c14e","bold 10px monospace");
+    let y=50;let any=false;
+    for(const k in QUESTS){const st=Game.data.quests[k];if(!st)continue;any=true;
+      const mark=st===2?"(done!)":st===1?"(active)":"(turned in)";
+      this.drawText(QUESTS[k].title+" "+mark,56,y,st===2?"#8fe89a":"#cbb6e2");y+=11;
+      this.drawText("  "+QUESTS[k].txt,64,y,"#8a7aa0");y+=13;}
+    if(!any)this.drawText("No quests yet. Talk to the villagers.",56,50,"#8a7aa0");
+    this.drawText("[A/B] back",56,VH-32,"#6a5a80");},
+  renderShop(){ctx.fillStyle="rgba(6,4,12,.85)";ctx.fillRect(0,0,VW,VH);
+    this.panel(40,20,VW-80,VH-40);
+    this.drawText(Game.shop==="bram"?"BRAM THE SMITH":"IVY THE HERBALIST",56,34,"#f2c14e","bold 10px monospace");
+    this.drawText("Gold: "+Game.data.gold,VW-140,34,"#f2c14e");
+    this.rows.forEach((r,i)=>{if(i>=this.sel-9&&i<=this.sel+2)
+      this.drawText((this.sel===i?"> ":"  ")+r.t,56,50+(i-this.sel+2)*12,this.sel===i?"#f2c14e":"#cbb6e2");});
+    this.drawText("[A] buy  [B] leave",56,VH-32,"#6a5a80");},
+  renderCraft(){ctx.fillStyle="rgba(6,4,12,.85)";ctx.fillRect(0,0,VW,VH);
+    this.panel(30,14,VW-60,VH-28);
+    this.drawText("ALCHEMY BENCH",46,28,"#f2c14e","bold 10px monospace");
+    this.drawText("Materials: "+Object.keys(Game.data.mats).map(k=>k.slice(0,2)+":"+Game.data.mats[k]).join(" "),46,40,"#8ff0e8");
+    this.rows.forEach((r,i)=>{const y=54+(i-(this.craftSel>8?this.craftSel-8:0))*13;if(y>VH-40)return;
+      const known=Game.data.recipes.includes(r.k)||r.k==="potion_cleanse"||r.k==="potion_tide";
+      const can=known&&Object.keys(r.r.recipe).every(m=>(Game.data.mats[m]||0)>=r.r.recipe[m]);
+      const rec=known?Object.keys(r.r.recipe).map(m=>m+"x"+r.r.recipe[m]).join(" "):"??? recipe unknown";
+      this.drawText((this.craftSel===i?"> ":"  ")+(known?r.r.name:"???")+"  ["+rec+"]"+(can?"  OK":""),46,y,
+        this.craftSel===i?"#f2c14e":can?"#8fe89a":"#6a5a80");});
+    this.drawText("[A] brew  [B] back",46,VH-22,"#6a5a80");},
+  renderMapScreen(){ctx.fillStyle="rgba(6,4,12,.85)";ctx.fillRect(0,0,VW,VH);
+    this.panel(40,20,VW-80,VH-40);
+    this.drawText("MAP",56,34,"#f2c14e","bold 10px monospace");
+    const names={village:"Emberdrift Village",meadow:"Meadow Shore",swamp:"Gloomswamp",
+      mountain:"Howling Mount",ruins:"Sky Ruins",abyss:"The Abyss",avatarRoom:"The Heart"};
+    let y=54;
+    for(const k of ["village","meadow","swamp","mountain","ruins","abyss","avatarRoom"]){
+      const cur=Game.data.map===k?" <-- you are here":"";
+      const seen=Game.data.flags["seen_"+k]||cur;
+      if(seen){this.drawText(names[k]+cur,56,y,cur?"#f2c14e":"#cbb6e2");y+=13;}}
+    this.drawText("[A/B] back",56,VH-32,"#6a5a80");},
+  renderDialog(){
+    const dl=Game.dialog;if(!dl)return;
+    const x=30,y=VH-78,w=VW-60,h=64;
+    this.panel(x,y,w,h);
+    // wrap text
+    ctx.font="8px monospace";ctx.textAlign="left";
+    const words=dl.lines[dl.i].split(" ");let line="",ly=y+16;
+    for(const wd of words){if(ctx.measureText(line+wd).width>w-24){this.drawText(line,x+10,ly,"#e8ecfc");line="";ly+=11;}
+      line+=wd+" ";}
+    this.drawText(line,x+10,ly,"#e8ecfc");
+    if(dl.opts){dl.opts.forEach((o,i)=>this.drawText((dl.i===i?"> ":"  ")+o.t,x+10,y+40+i*11,dl.i===i?"#f2c14e":"#cbb6e2"));}
+    else this.drawText("[A]",x+w-20,y+h-8,"#f2c14e");},
+  renderWorld(){
+    ctx.fillStyle="#0b0817";ctx.fillRect(0,0,VW,VH);
+    ctx.save();
+    ctx.translate(-Math.round(WORLD.cam.x),-Math.round(WORLD.cam.y));
+    // tiles
+    const x0=Math.max(0,WORLD.cam.x/TS|0),y0=Math.max(0,WORLD.cam.y/TS|0);
+    for(let ty=y0;ty<Math.min(MH,y0+18);ty++)for(let tx=x0;tx<Math.min(MW,x0+31);tx++){
+      const t=tileAt(tx,ty);const img=TILES[CH2TILE[t]]||TILES.grass;
+      ctx.drawImage(img,tx*TS,ty*TS);}
+    // objects
+    for(const o of WORLD.objects){const ox=o.x*TS,oy=o.y*TS;
+      if(o.to)ctx.drawImage(TILES.gate,ox,oy);
+      else if(o.house)drawHouse(ctx,ox,oy);
+      else if(o.shopstall)ctx.drawImage(TILES.shopstall,ox,oy);
+      else if(o.save)ctx.drawImage(TILES.shrine,ox,oy);
+      else if(o.corrupt){ctx.drawImage(TILES.shrine,ox,oy);
+        ctx.fillStyle="rgba(143,90,184,"+(0.4+0.2*Math.sin(Game.time*3))+")";ctx.fillRect(ox+4,oy+2,8,12);}
+      else if(o.bench)ctx.drawImage(TILES.bench,ox,oy);
+      else if(o.loot)ctx.drawImage(o.used?TILES.chestOpen:TILES.chest,ox,oy);
+      else if(o.herbNode&&!o.used)ctx.drawImage(TILES.herb,ox,oy);
+      else if(o.boss){ctx.fillStyle="rgba(200,60,60,"+(0.25+0.15*Math.sin(Game.time*4))+")";
+        ctx.beginPath();ctx.arc(ox+8,oy+8,20,0,6.283);ctx.fill();}}
+    // npcs
+    for(const n of WORLD.npcs){ctx.drawImage(hero.down[0],n.x-8,n.y-14);
+      this.drawText(n.name,n.x-12,n.y-18,"#f2c14e","6px monospace");}
+    // enemies
+    for(const e of WORLD.enemies){if(e.dead)continue;
+      const img=ENEMY_SPRITES[e.art]||ENEMY_SPRITES.wisp;
+      const bob=e.ai==="drift"?Math.sin(e.t*3)*2:0;
+      if(e.flash>0){ctx.save();ctx.globalCompositeOperation="source-over";
+        ctx.drawImage(img,e.x-8,e.y-12+bob);
+        ctx.globalAlpha=.6;ctx.fillStyle="#fff";ctx.fillRect(e.x-8,e.y-12+bob,16,16);ctx.restore();}
+      else ctx.drawImage(img,e.x-8,e.y-12+bob);
+      if(e.hp<e.maxhp){ctx.fillStyle="#3a2a35";ctx.fillRect(e.x-7,e.y-16,14,2);
+        ctx.fillStyle="#e84a5a";ctx.fillRect(e.x-7,e.y-16,14*e.hp/e.maxhp,2);}}
+    // boss
+    if(Game.boss&&!Game.boss.dead){const B=Game.boss;
+      const img=BOSS_SPRITES[B.key];
+      ctx.drawImage(img,B.x-24,B.y-30+Math.sin(B.t*2)*3);
+      if(B.flash>0){ctx.globalAlpha=.5;ctx.fillStyle="#fff";ctx.fillRect(B.x-24,B.y-30,48,48);ctx.globalAlpha=1;}}
+    // salamander companion follows
+    const p=Game.player,sw=Math.sin(Game.time*3)*2;
+    const sx=p.x+(p.dir==="sideR"?-12:12),sy=p.y-6+sw;
+    ctx.drawImage(sal[Math.floor(p.anim*4)%4],sx-7,sy-5);
+    // player
+    const fd=p.dir==="sideR"||p.dir==="sideL"?hero.side:p.dir==="up"?hero.up:hero.down;
+    const fi=Math.floor(p.anim)%4;
+    ctx.save();
+    if(p.dir==="sideL"){ctx.translate(Math.round(p.x),0);ctx.scale(-1,1);ctx.translate(-Math.round(p.x),0);}
+    if(p.inv>0&&Math.floor(Game.time*20)%2===0)ctx.globalAlpha=.4;
+    ctx.drawImage(fd[fi],Math.round(p.x-8),Math.round(p.y-14));
+    ctx.restore();
+    // weapon swing arc
+    if(p.swing>0){const w=WEAPONS[Game.data.weapon];
+      const dx=p.dir==="sideR"?1:p.dir==="sideL"?-1:0,dy=p.dir==="down"?1:p.dir==="up"?-1:0;
+      ctx.strokeStyle="#e8ecfc";ctx.lineWidth=2;
+      const a0=Math.atan2(dy,dx)-.7,a1=Math.atan2(dy,dx)+.7;
+      ctx.beginPath();ctx.arc(p.x,p.y,w.range,Math.min(a0,a1),Math.max(a0,a1));ctx.stroke();ctx.lineWidth=1;}
+    // projectiles
+    for(const pr of Game.proj){
+      ctx.fillStyle=pr.ally?(pr.elem==="fire"?"#ff9a4d":pr.elem==="frost"?"#8fc9ff":pr.elem==="venom"?"#b86bb8":pr.elem==="shock"?"#f2d16b":"#7df0dd"):"#c05a78";
+      ctx.fillRect(pr.x-2,pr.y-2,4,4);}
+    // drops
+    for(const d of Game.drops){
+      if(d.gold){ctx.fillStyle="#f2c14e";ctx.fillRect(d.x-2,d.y-2,4,4);}
+      else ctx.drawImage(MAT_ICONS[d.item]||MAT_ICONS.herb,d.x-4,d.y-4);}
+    FX.render();
+    ctx.restore();
+    // screen-space HUD
+    this.renderHUD();
+    if(Game.chapterCard>0){Game.chapterCard-=1/60;
+      ctx.fillStyle="rgba(6,4,12,"+Math.min(1,Game.chapterCard)+")";ctx.fillRect(0,0,VW,VH);
+      const c=CHAPTERS.find(c=>c.ch===Game.data.chapter);
+      if(c){ctx.textAlign="center";ctx.fillStyle="#f2c14e";ctx.font="bold 14px monospace";
+        ctx.fillText(c.title,VW/2,VH/2-8);ctx.fillStyle="#cbb6e2";ctx.font="9px monospace";
+        ctx.fillText(c.sub,VW/2,VH/2+10);}}
+    this.renderDialog();
+    FX.renderFade();
+  },
+  titleScene(){
+    const self=this;
+    Scenes.switchTo({update(dt){Input.poll();const b=Input.consume();
+      if(Input.axes.y<-.5&&!self._ty){self.titleSel=(self.titleSel+2)%3;Audio.sfx("menu");self._ty=1;}
+      if(Input.axes.y>.5&&!self._tyy){self.titleSel=(self.titleSel+1)%3;Audio.sfx("menu");self._tyy=1;}
+      if(!Input.axes.y){self._ty=0;self._tyy=0;}
+      if(b.a){Audio.sfx("confirm");
+        if(self.titleSel===0)Game.start(true);
+        else if(self.titleSel===1){if(Save.data&&Save.data.playtime>0)Game.start(false);else{Game.msg="No save yet.";Game.msgT=2;}}
+        else if(self.titleSel===2){if(Save.data&&Save.data.bossRush)Game.startBossRush();
+          else{Game.msg="Beat the story to unlock boss rush.";Game.msgT=2;}}}
+      },render(){self.renderTitle();}});},
+  renderTitle(){ctx.fillStyle="#2b1b3f";ctx.fillRect(0,0,VW,VH);
+    ctx.textAlign="center";
+    ctx.fillStyle="#f2c14e";ctx.font="bold 34px monospace";ctx.fillText("TIDEFALL",VW/2,90);
+    ctx.fillStyle="#8ff0e8";ctx.font="8px monospace";ctx.fillText("an alchemist's tale of the violet sea",VW/2,104);
+    const opts=["New game","Continue","Boss rush"];
+    opts.forEach((t,i)=>{ctx.fillStyle=this.titleSel===i?"#f2c14e":"#cbb6e2";ctx.font="10px monospace";
+      ctx.fillText((this.titleSel===i?"> ":"")+t,VW/2,140+i*16);});
+    ctx.fillStyle="#5a5a7a";ctx.font="7px monospace";
+    ctx.fillText("WASD/arrows move  A(Z) attack  B(X) potion/throw  Esc menu",VW/2,250);},
+  renderEnding(key){const e=ENDINGS[key];
+    ctx.fillStyle="#0b0817";ctx.fillRect(0,0,VW,VH);
+    ctx.textAlign="center";ctx.fillStyle="#f2c14e";ctx.font="bold 13px monospace";
+    ctx.fillText(e.title,VW/2,50);
+    ctx.fillStyle="#cbb6e2";ctx.font="9px monospace";
+    e.lines.forEach((l,i)=>ctx.fillText(l,VW/2,80+i*15));
+    ctx.fillStyle="#5a5a7a";ctx.font="8px monospace";
+    ctx.fillText("[A] back to title",VW/2,VH-20);},
+  bossRushStart(){
+    const self=this;Game.start(false);Game.data.bossRush=true;
+    Game.data.map="ruins";Game.data.px=360;Game.data.py=370;
+    Scenes.switchTo(worldScene());
+    Game.startBoss("fenmaw");Game.bossDef=null;
+    // chain bosses: when one dies, next spawns
+    const orig=Game.bossDown.bind(Game);
+    Game.bossDown=function(){const done=Game._rush||0;
+      const order=["fenmaw","bogmother","stormgolem","skywarden","leviathan","avatar"];
+      Game.msg=order[done]+" down!";Game.msgT=2;Game.boss=null;
+      if(done>=5){Game.msg="BOSS RUSH COMPLETE!";Game.msgT=4;Game.data.bossRushBest=Date.now();Save.write();Scenes.switchTo({update(){},render:()=>self.renderTitle()});}
+      else{Game._rush=done+1;const nx=BOSSES.find(b=>b.id===order[done+1]);
+        Game.bossDef=nx;Game.boss={big:1,key:nx.id,x:Game.player.x+40,y:Game.player.y-30,w:28,h:22,
+          hp:nx.hp*1.2,maxhp:nx.hp*1.2,dmg:nx.dmg,t:0,cd:1.2,phase:1,flash:0,spd:20,dead:false,vx:0,vy:0};
+        Audio.sfx("boss");}};
+  }
+};
+function worldScene(){
+  return {update(dt){Game.update(dt);FX.update(dt);},render(){UI.renderWorld();}};
+}
+function confirmQuitOK(){return true;}
+
+// main.js - boot, game over, wiring
+"use strict";
+Save.load();
+const Boot={t:0,
+  update(dt){this.t+=dt;if(this.t>.4)Scenes.switchTo(TITLE_SCENE());},
+  render(){ctx.fillStyle="#0b0817";ctx.fillRect(0,0,VW,VH);}};
+function TITLE_SCENE(){const s={update(dt){UI.titleSceneUpdate&&null;},render(){UI.renderTitle();}};
+  // rewire title logic into scene
+  s.update=function(dt){Input.poll();const b=Input.consume();
+    if(Input.axes.y<-.5&&!UI._t1){UI.titleSel=(UI.titleSel+2)%3;Audio.sfx("menu");UI._t1=1;}
+    if(Input.axes.y>.5&&!UI._t2){UI.titleSel=(UI.titleSel+1)%3;Audio.sfx("menu");UI._t2=1;}
+    if(!Input.axes.y){UI._t1=0;UI._t2=0;}
+    if(b.a){Audio.sfx("confirm");
+      if(UI.titleSel===0){Game.start(true);Scenes.switchTo(worldScene());}
+      else if(UI.titleSel===1){
+        if(Save.data&&Save.data.playtime>0){Game.start(false);Scenes.switchTo(worldScene());}
+        else{Save.data=Save.fresh();Game.start(true);Scenes.switchTo(worldScene());}}
+      else if(UI.titleSel===2){Game.startBossRush();}}};
+  Audio.play("title");return s;}
+Game.startBossRush=function(){
+  Game.start(false);Game.data.bossRush=true;Game._rush=0;
+  Game.data.map="ruins";Game.data.px=360;Game.data.py=370;
+  buildMap("ruins");Game.player.x=360;Game.player.y=370;
+  Scenes.switchTo(worldScene());
+  const order=["fenmaw","bogmother","stormgolem","skywarden","leviathan","avatar"];
+  Game._rushOrder=order;
+  const def=BOSSES.find(b=>b.id===order[0]);
+  Game.bossDef=def;
+  Game.boss={big:1,key:def.id,x:Game.player.x+40,y:Game.player.y-40,w:28,h:22,
+    hp:def.hp*1.2,maxhp:def.hp*1.2,dmg:def.dmg,t:0,cd:1.2,phase:1,flash:0,spd:20,dead:false,vx:0,vy:0};
+  Game.msg="BOSS RUSH: "+def.name;Game.msgT=2;Audio.sfx("boss");Audio.play("boss");
+  Game.bossDown=function(){const i=Game._rush;
+    Game.boss=null;
+    if(i>=5){Game.msg="BOSS RUSH COMPLETE!";Game.msgT=5;Game.data.bossRushDone=true;Save.write();
+      setTimeout(()=>UI.titleScene(),100);}
+    else{Game._rush=i+1;const nx=BOSSES.find(b=>b.id===order[i+1]);
+      Game.bossDef=nx;Game.boss={big:1,key:nx.id,x:Game.player.x+40,y:Game.player.y-40,w:28,h:22,
+        hp:nx.hp*1.2,maxhp:nx.hp*1.2,dmg:nx.dmg,t:0,cd:1.2,phase:1,flash:0,spd:20,dead:false,vx:0,vy:0};
+      Game.msg=nx.name+"!";Game.msgT=2;Audio.sfx("boss");}};};
+// game over overlay woven into world scene
+const _worldUpdate=worldScene;
+worldScene=function(){
+  const s=_worldUpdate();
+  const base=s.update;
+  s.update=function(dt){
+    const p=Game.player;
+    if(p.dead){Input.poll();const b=Input.consume();
+      if(b.a){p.dead=false;p.hp=Game.hpMax;
+        Game.data.gold=Math.floor(Game.data.gold*.9);
+        buildMap("village");p.x=352;p.y=190;Game.data.map="village";Game.save();
+        Game.msg="You wake at the village shrine.";Game.msgT=2.5;Audio.play("village");}
+      return;}
+    base(dt);};
+  s.render=function(){UI.renderWorld();
+    if(Game.player.dead){
+      ctx.fillStyle="rgba(6,4,12,.8)";ctx.fillRect(0,0,VW,VH);
+      ctx.textAlign="center";ctx.fillStyle="#e84a5a";ctx.font="bold 16px monospace";
+      ctx.fillText("THE TIDE TOOK YOU",VW/2,VH/2-10);
+      ctx.fillStyle="#cbb6e2";ctx.font="9px monospace";
+      ctx.fillText("[A] wake at the shrine (lose some gold)",VW/2,VH/2+14);}};
+  return s;};
+// mark maps seen
+const _buildMap=buildMap;
+buildMap=function(key){_buildMap(key);Game.data.flags["seen_"+key]=true;};
+Scenes.push(Boot);
+
+</script>
+</body>
+</html>
